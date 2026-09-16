@@ -22,6 +22,8 @@ class CapturedPilotCase:
     ``attention_input`` is the actual post-AdaLN input observed by the native
     attention module during the full-model forward. It is retained separately so
     callers can verify that replay reproduces the live execution point exactly.
+    ``captured_bytes`` is the cumulative CPU payload held by the capture session
+    when this block completed.
     """
 
     block_index: int
@@ -36,14 +38,9 @@ class _CpuCloneBudget:
             raise ValueError("capture byte budget must be positive")
         self.limit_bytes = int(limit_bytes)
         self.used_bytes = 0
-        self._cache: dict[int, torch.Tensor] = {}
+        self._shared_cache: dict[int, torch.Tensor] = {}
 
-    def tensor(self, value: torch.Tensor | None) -> torch.Tensor | None:
-        if value is None:
-            return None
-        cached = self._cache.get(id(value))
-        if cached is not None:
-            return cached
+    def _clone(self, value: torch.Tensor) -> torch.Tensor:
         nbytes = int(value.numel() * value.element_size())
         if self.used_bytes + nbytes > self.limit_bytes:
             raise RuntimeError(
@@ -51,19 +48,40 @@ class _CpuCloneBudget:
                 f"used={self.used_bytes}, next={nbytes}, limit={self.limit_bytes}"
             )
         clone = value.detach().to(device="cpu", copy=True)
-        self._cache[id(value)] = clone
         self.used_bytes += nbytes
         return clone
 
-    def object(self, value: Any) -> Any:
+    def snapshot_tensor(self, value: torch.Tensor | None) -> torch.Tensor | None:
+        """Clone an observation even when the source object was seen before.
+
+        H3 mutates its residual stream in place. Object identity therefore cannot be
+        used to deduplicate block-entry or post-AdaLN activation snapshots: the same
+        tensor object may represent different numerical states at successive blocks.
+        """
+        if value is None:
+            return None
+        return self._clone(value)
+
+    def shared_tensor(self, value: torch.Tensor | None) -> torch.Tensor | None:
+        """Clone an immutable-by-contract tensor once and reuse the CPU copy."""
+        if value is None:
+            return None
+        cached = self._shared_cache.get(id(value))
+        if cached is not None:
+            return cached
+        clone = self._clone(value)
+        self._shared_cache[id(value)] = clone
+        return clone
+
+    def snapshot_object(self, value: Any) -> Any:
         if torch.is_tensor(value):
-            return self.tensor(value)
+            return self.snapshot_tensor(value)
         if isinstance(value, tuple):
-            return tuple(self.object(v) for v in value)
+            return tuple(self.snapshot_object(v) for v in value)
         if isinstance(value, list):
-            return [self.object(v) for v in value]
+            return [self.snapshot_object(v) for v in value]
         if isinstance(value, dict):
-            return {k: self.object(v) for k, v in value.items()}
+            return {k: self.snapshot_object(v) for k, v in value.items()}
         return value
 
 
@@ -133,9 +151,10 @@ class PilotActivationCapture:
 
     The session is intentionally one-forward-only. A selected block executing twice
     is rejected rather than silently mixing sampler/forecast/re-entrant evaluations.
-    Tensors are detached and copied to CPU under an explicit byte budget. Tensor
-    objects reused across blocks (for example RoPE/timestep tensors) are cloned once.
-    Hooks are always removed when the context exits.
+    Mutable activations are snapshotted per observation; only H3 inputs that are
+    immutable across the block loop (timestep embedding, RoPE table, layout position
+    IDs) are interned. All tensors are detached and copied to CPU under an explicit
+    byte budget. Hooks are always removed when the context exits.
     """
 
     def __init__(
@@ -235,10 +254,10 @@ class PilotActivationCapture:
 
             layout = options.get("minimax_h3_layout")
             position_ids, layout_context = _layout_capture_context(layout)
-            x_cpu = self.budget.tensor(x)
-            t_cpu = self.budget.tensor(t_emb)
-            rope_cpu = self.budget.tensor(rope_freqs) if torch.is_tensor(rope_freqs) else None
-            pos_cpu = self.budget.tensor(position_ids) if position_ids is not None else None
+            x_cpu = self.budget.snapshot_tensor(x)
+            t_cpu = self.budget.shared_tensor(t_emb)
+            rope_cpu = self.budget.shared_tensor(rope_freqs) if torch.is_tensor(rope_freqs) else None
+            pos_cpu = self.budget.shared_tensor(position_ids) if position_ids is not None else None
             if pos_cpu is not None and pos_cpu.shape[0] != x_cpu.shape[0]:
                 raise RuntimeError(
                     f"captured layout position rows {pos_cpu.shape[0]} != block rows {x_cpu.shape[0]}"
@@ -253,7 +272,7 @@ class PilotActivationCapture:
             self._pending[block_index] = {
                 "x": x_cpu,
                 "t_emb": t_cpu,
-                "mod_segments": self.budget.object(mod_segments),
+                "mod_segments": self.budget.snapshot_object(mod_segments),
                 "rope_freqs": rope_cpu,
                 "position_ids": pos_cpu,
                 "context": context,
@@ -270,7 +289,7 @@ class PilotActivationCapture:
                 raise RuntimeError(f"attention for pilot block {block_index} executed more than once")
             if not args or not torch.is_tensor(args[0]):
                 raise RuntimeError("native attention hook did not receive the post-AdaLN hidden tensor")
-            hidden = self.budget.tensor(args[0])
+            hidden = self.budget.snapshot_tensor(args[0])
             if hidden.shape != pending["x"].shape:
                 raise RuntimeError("post-AdaLN attention input shape does not match captured block input")
             pending["attention_input"] = hidden

@@ -59,7 +59,7 @@ def _inputs():
     return x, t_emb, segments, rope, options
 
 
-def test_live_capture_clones_pre_mutation_block_inputs_and_post_adaln_attention_inputs() -> None:
+def test_live_capture_clones_each_mutable_activation_state_and_post_adaln_input() -> None:
     model = TinyModel()
     x, t_emb, segments, rope, options = _inputs()
     original = x.clone()
@@ -87,21 +87,32 @@ def test_live_capture_clones_pre_mutation_block_inputs_and_post_adaln_attention_
     assert "minimax_h3_layout" in capture_context["transformer_options"]
     assert first.captured_bytes > 0
 
+    # The same residual tensor object is mutated in place through every block. A correct
+    # capture must snapshot its numerical state per observation rather than deduplicating
+    # by object identity. Block 2 sees the result of blocks 0 and 1.
+    after_block0 = original * 1.25 + 0.5
+    expected_block2_input = after_block0 * 1.25 + 0.5
+    second = records[1]
+    torch.testing.assert_close(second.case.x, expected_block2_input)
+    torch.testing.assert_close(second.attention_input, expected_block2_input + 2.0)
+    assert not torch.equal(first.case.x, second.case.x)
+
     # The original stream is mutated by the model, but captured tensors are private CPU copies.
     assert not torch.equal(x, original)
     torch.testing.assert_close(first.case.x, original)
 
 
-def test_reused_timestep_and_rope_tensors_are_interned_under_one_byte_budget() -> None:
+def test_reused_immutable_timestep_rope_and_position_tensors_are_interned() -> None:
     model = TinyModel()
     x, t_emb, segments, rope, options = _inputs()
-    # Exact unique payload: block inputs differ, but t_emb/rope/layout position_ids are shared.
+    # x and post-AdaLN h are mutable snapshots per block. t_emb/rope/position_ids are
+    # immutable across the H3 block loop and therefore count once.
     unique_bytes = (
         3 * x.numel() * x.element_size()
         + t_emb.numel() * t_emb.element_size()
         + rope.numel() * rope.element_size()
         + options["minimax_h3_layout"].position_ids.numel() * options["minimax_h3_layout"].position_ids.element_size()
-        + 3 * x.numel() * x.element_size()  # post-AdaLN attention inputs differ per block
+        + 3 * x.numel() * x.element_size()
     )
     with PilotActivationCapture(
         model,
@@ -112,7 +123,11 @@ def test_reused_timestep_and_rope_tensors_are_interned_under_one_byte_budget() -
         block_indices=(0, 1, 2),
     ) as capture:
         model(x, t_emb, segments, rope, transformer_options=options)
-    assert capture.records()[-1].captured_bytes <= unique_bytes
+    records = capture.records()
+    assert records[-1].captured_bytes == unique_bytes
+    assert records[0].case.t_emb is records[1].case.t_emb is records[2].case.t_emb
+    assert records[0].case.rope_freqs is records[1].case.rope_freqs is records[2].case.rope_freqs
+    assert records[0].case.position_ids is records[1].case.position_ids is records[2].case.position_ids
 
 
 def test_capture_fails_closed_when_explicit_budget_is_exceeded_and_removes_hooks() -> None:
@@ -130,7 +145,8 @@ def test_capture_fails_closed_when_explicit_budget_is_exceeded_and_removes_hooks
             model(x, t_emb, segments, rope, transformer_options=options)
 
     # Hook cleanup is unconditional; the same model runs normally after the failed capture.
-    model(*_inputs()[:4], transformer_options=_inputs()[4])
+    x2, t2, segments2, rope2, options2 = _inputs()
+    model(x2, t2, segments2, rope2, transformer_options=options2)
 
 
 def test_capture_rejects_multiple_selected_block_executions_in_one_session() -> None:
