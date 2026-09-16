@@ -7,6 +7,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+import minimax_h3_keyless.pilot_artifacts as pilot_artifacts
 from minimax_h3_keyless.attention import KeylessAttentionTrain
 from minimax_h3_keyless.checkpoint import sha256_file
 from minimax_h3_keyless.pilot import set_pilot_block_stage
@@ -82,6 +83,72 @@ def test_stage_a_artifact_transaction_binds_resume_hash_and_refuses_overwrite(tm
             step=8,
             result_payload={},
         )
+
+
+def test_result_publish_race_preserves_foreign_result_and_rolls_back_our_checkpoint(
+    tmp_path: Path, monkeypatch
+) -> None:
+    student, optimizer = _student_and_optimizer()
+    request = StageAArtifactRequest(str(tmp_path), "pilot-race-result", "deadbeef")
+    checkpoint_path, result_path = request.paths(25, "route")
+    sentinel = b"foreign immutable result\n"
+    original_publish = pilot_artifacts._publish_no_replace
+    calls = 0
+
+    def raced_publish(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            assert destination == result_path
+            destination.write_bytes(sentinel)
+        original_publish(source, destination)
+
+    monkeypatch.setattr(pilot_artifacts, "_publish_no_replace", raced_publish)
+    with pytest.raises(FileExistsError, match="immutable"):
+        persist_stage_a_block_artifacts(
+            request,
+            student_block=student,
+            optimizer=optimizer,
+            identity=_identity("pilot-race-result"),
+            stage="route",
+            step=1,
+            result_payload={"metric": 1.0},
+        )
+
+    assert not checkpoint_path.exists()
+    assert result_path.read_bytes() == sentinel
+    assert not list(tmp_path.glob("*.publish"))
+
+
+def test_checkpoint_publish_race_preserves_foreign_checkpoint_and_writes_no_result(
+    tmp_path: Path, monkeypatch
+) -> None:
+    student, optimizer = _student_and_optimizer()
+    request = StageAArtifactRequest(str(tmp_path), "pilot-race-checkpoint", "deadbeef")
+    checkpoint_path, result_path = request.paths(25, "route")
+    sentinel = b"foreign immutable checkpoint\n"
+    original_publish = pilot_artifacts._publish_no_replace
+
+    def raced_publish(source: Path, destination: Path) -> None:
+        if destination == checkpoint_path and not destination.exists():
+            destination.write_bytes(sentinel)
+        original_publish(source, destination)
+
+    monkeypatch.setattr(pilot_artifacts, "_publish_no_replace", raced_publish)
+    with pytest.raises(FileExistsError, match="immutable"):
+        persist_stage_a_block_artifacts(
+            request,
+            student_block=student,
+            optimizer=optimizer,
+            identity=_identity("pilot-race-checkpoint"),
+            stage="route",
+            step=1,
+            result_payload={"metric": 1.0},
+        )
+
+    assert checkpoint_path.read_bytes() == sentinel
+    assert not result_path.exists()
+    assert not list(tmp_path.glob("*.publish"))
 
 
 def test_stage_a_artifact_request_rejects_path_traversal_and_identity_mismatch(tmp_path: Path) -> None:
