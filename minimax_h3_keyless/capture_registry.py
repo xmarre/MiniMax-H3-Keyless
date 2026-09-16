@@ -13,11 +13,11 @@ from .capture_io import (
     load_captured_pilot_bundle,
 )
 from .checkpoint import sha256_file
+from .immutable_io import write_json_no_replace
 from .pilot_campaign import (
     PILOT_BLOCKS,
     load_json_manifest,
     validate_pilot_dataset_manifest,
-    write_json_atomic,
 )
 from .pilot_inputs import CANONICAL_STAGE_A_COVERAGE_TAGS, CAPTURE_REGISTRY_SCHEMA
 
@@ -89,7 +89,8 @@ def build_stage_a_capture_registry(
     Each capture bundle is hash-checked and deserialized one at a time, then released.
     This proves exact case×sigma coverage without retaining the full activation corpus in
     memory merely to construct the registry. The offline pilot runner performs its own
-    independent registry/bundle validation before training.
+    independent registry/bundle validation before training. Publication is atomic and
+    no-replace, so a concurrent writer cannot overwrite an existing registry identity.
     """
     dataset_manifest = load_json_manifest(dataset_manifest_path)
     dataset_sha = validate_pilot_dataset_manifest(
@@ -191,7 +192,12 @@ def build_stage_a_capture_registry(
         "dataset_manifest_sha256": dataset_sha,
         "artifacts": artifacts,
     }
-    registry_sha = write_json_atomic(output_path, payload)
+    try:
+        registry_sha = write_json_no_replace(output_path, payload)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Stage-A capture registry is immutable; choose a new output path: {output_path}"
+        ) from exc
     return StageACaptureRegistryBuildResult(
         registry_path=str(output_path),
         registry_sha256=registry_sha,
