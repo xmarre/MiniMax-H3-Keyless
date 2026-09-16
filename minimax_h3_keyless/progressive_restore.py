@@ -326,6 +326,86 @@ def _fold_training_attention(training: KeylessAttentionTrain) -> KeylessAttentio
     return deploy
 
 
+def _load_folded_attention_for_accepted_block(
+    native_block: nn.Module,
+    prefix: ProgressivePrefix,
+    accepted: ProgressiveAcceptedBlock,
+    *,
+    offset: int,
+    output_dir: str | Path,
+    student_builder: StudentBuilder,
+) -> KeylessAttentionDeploy:
+    prior = _prefix_before(prefix, offset)
+    checkpoint_path, result_path = _artifact_paths(output_dir, prefix, accepted)
+    loaded_result = _load_result(
+        result_path,
+        expected_sha256=accepted.result_sha256,
+        accepted=accepted,
+        prefix_before=prior,
+        expected_checkpoint_filename=checkpoint_path.name,
+    )
+    state = _load_student_state(
+        checkpoint_path,
+        expected_sha256=accepted.checkpoint_sha256,
+        accepted=accepted,
+        identity=loaded_result.identity,
+        result_payload_sha256=loaded_result.result_payload_sha256,
+        expected_step=loaded_result.step,
+    )
+    student = student_builder(native_block, offset)
+    training_attention = getattr(student, "attn", None)
+    if not isinstance(training_attention, KeylessAttentionTrain):
+        raise RuntimeError(
+            "progressive restore student builder did not install KeylessAttentionTrain"
+        )
+    if int(getattr(training_attention, "block_index", -1)) != offset:
+        raise RuntimeError(
+            "progressive restore student builder installed the wrong block_index"
+        )
+    attention_state = _attention_state_from_full_checkpoint(
+        state,
+        native_block=native_block,
+        training_attention=training_attention,
+    )
+    training_attention.load_state_dict(attention_state, strict=True)
+    return _fold_training_attention(training_attention)
+
+
+def load_progressive_deploy_attentions(
+    model: nn.Module,
+    prefix: ProgressivePrefix,
+    *,
+    output_dir: str | Path,
+    student_builder: StudentBuilder = _default_student_builder,
+) -> tuple[KeylessAttentionDeploy, ...]:
+    """Materialize accepted deploy attentions without mutating the native teacher model.
+
+    This is the safe boundary used by Comfy ModelPatcher object overlays: the shared base
+    teacher remains native QKV, while each returned attention is independently reconstructed
+    from the immutable accepted result/checkpoint pair.
+    """
+    native_prefix = _prefix_before(prefix, 0)
+    validate_progressive_model_prefix(model, native_prefix)
+    blocks = getattr(model, "blocks", None)
+    assert blocks is not None
+
+    out: list[KeylessAttentionDeploy] = []
+    for offset, accepted in enumerate(prefix.accepted):
+        if accepted.block_index != offset:
+            raise RuntimeError("accepted progressive prefix is not contiguous early-to-late")
+        out.append(
+            _load_folded_attention_for_accepted_block(
+                blocks[offset],
+                prefix,
+                accepted,
+                offset=offset,
+                output_dir=output_dir,
+                student_builder=student_builder,
+            )
+        )
+    return tuple(out)
+
+
 def restore_progressive_model_prefix(
     model: nn.Module,
     prefix: ProgressivePrefix,
@@ -353,44 +433,17 @@ def restore_progressive_model_prefix(
     assert blocks is not None
 
     for offset, accepted in enumerate(prefix.accepted):
-        prior = _prefix_before(prefix, offset)
         if accepted.block_index != offset:
             raise RuntimeError("accepted progressive prefix is not contiguous early-to-late")
-        checkpoint_path, result_path = _artifact_paths(output_dir, prefix, accepted)
-        loaded_result = _load_result(
-            result_path,
-            expected_sha256=accepted.result_sha256,
-            accepted=accepted,
-            prefix_before=prior,
-            expected_checkpoint_filename=checkpoint_path.name,
-        )
-        state = _load_student_state(
-            checkpoint_path,
-            expected_sha256=accepted.checkpoint_sha256,
-            accepted=accepted,
-            identity=loaded_result.identity,
-            result_payload_sha256=loaded_result.result_payload_sha256,
-            expected_step=loaded_result.step,
-        )
-
         native_block = blocks[offset]
-        student = student_builder(native_block, offset)
-        training_attention = getattr(student, "attn", None)
-        if not isinstance(training_attention, KeylessAttentionTrain):
-            raise RuntimeError(
-                "progressive restore student builder did not install KeylessAttentionTrain"
-            )
-        if int(getattr(training_attention, "block_index", -1)) != offset:
-            raise RuntimeError(
-                "progressive restore student builder installed the wrong block_index"
-            )
-        attention_state = _attention_state_from_full_checkpoint(
-            state,
-            native_block=native_block,
-            training_attention=training_attention,
+        folded_attention = _load_folded_attention_for_accepted_block(
+            native_block,
+            prefix,
+            accepted,
+            offset=offset,
+            output_dir=output_dir,
+            student_builder=student_builder,
         )
-        training_attention.load_state_dict(attention_state, strict=True)
-        folded_attention = _fold_training_attention(training_attention)
 
         original_attention = native_block.attn
         try:
