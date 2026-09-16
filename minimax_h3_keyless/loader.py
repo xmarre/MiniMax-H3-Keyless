@@ -1,13 +1,44 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Mapping
 
 import torch
 
 from .checkpoint import validate_deploy_checkpoint
-from .contracts import CONTRACT_KEY, HIDDEN_SIZE, HEADS, HEAD_DIM
+from .contracts import (
+    CONTRACT_KEY,
+    HEAD_DIM,
+    HEADS,
+    HIDDEN_SIZE,
+    contract_from_metadata,
+)
 from .model import make_comfy_keyless_model_class
+
+
+def _merge_metadata_config(
+    derived: Mapping[str, Any], metadata: Mapping[str, str]
+) -> dict[str, Any]:
+    """Merge optional constructor metadata without letting it rewrite proven structure."""
+    cfg = dict(derived)
+    config_json = metadata.get("config")
+    if not config_json:
+        return cfg
+    try:
+        parsed = json.loads(config_json)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("MiniMax H3 metadata config is not valid JSON") from exc
+    if not isinstance(parsed, dict):
+        raise RuntimeError("MiniMax H3 metadata config must decode to an object")
+    for key, value in parsed.items():
+        if key in cfg and value != cfg[key]:
+            raise RuntimeError(
+                "MiniMax H3 metadata config contradicts checkpoint structure: "
+                f"{key}={value!r}, derived={cfg[key]!r}"
+            )
+        cfg[key] = value
+    return cfg
 
 
 def _derive_h3_unet_config(sd: Mapping[str, torch.Tensor], metadata: Mapping[str, str]) -> dict[str, Any]:
@@ -28,26 +59,19 @@ def _derive_h3_unet_config(sd: Mapping[str, torch.Tensor], metadata: Mapping[str
         table = sd["adaln_t_table"].shape
         cfg["adaln_curve_grid"] = table[0]
         cfg["time_embed_dim"] = table[1]
-    config_json = metadata.get("config")
-    if config_json:
-        import json
-        parsed = json.loads(config_json)
-        if not isinstance(parsed, dict):
-            raise RuntimeError("MiniMax H3 metadata config must decode to an object")
-        cfg.update(parsed)
-    return cfg
+    return _merge_metadata_config(cfg, metadata)
 
 
 def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | None = None):
     """Load a canonical Keyless H3 artifact as an ordinary Comfy ModelPatcher."""
     model_options = dict(model_options or {})
     try:
+        import comfy.model_base
         import comfy.model_management
         import comfy.model_patcher
         import comfy.storage
         import comfy.supported_models
         import comfy.utils
-        import comfy.model_base
     except ImportError as exc:
         raise RuntimeError("ComfyUI is required to load a Keyless H3 model") from exc
 
@@ -113,7 +137,9 @@ def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | N
         model.to(offload_device)
     model.load_model_weights(sd, "", assign=patcher.is_dynamic())
 
-    contract = getattr(model.diffusion_model, CONTRACT_KEY)
-    if contract.architecture != metadata["architecture"]:
+    loaded_contract = contract_from_metadata(metadata)
+    existing_contract = getattr(model.diffusion_model, CONTRACT_KEY)
+    if existing_contract.architecture != loaded_contract.architecture:
         raise RuntimeError("loaded Keyless model contract does not match checkpoint architecture")
+    setattr(model.diffusion_model, CONTRACT_KEY, loaded_contract)
     return patcher
