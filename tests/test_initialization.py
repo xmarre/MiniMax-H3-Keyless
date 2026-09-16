@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from minimax_h3_keyless.attention import KeylessAttentionTrain
@@ -43,56 +44,46 @@ def test_identity_initialization_copies_q_v_norms_and_out() -> None:
     assert report.lambda_actual is None
 
 
-def test_least_squares_initialization_recovers_design_query_factor_storage() -> None:
+def test_least_squares_initialization_installs_activation_derived_storage_route() -> None:
     torch.manual_seed(32)
     hidden, heads, head_dim = 8, 2, 3
     inner = heads * head_dim
-    q = torch.randn(inner, hidden)
-    v = torch.randn(inner, hidden)
+    teacher = _teacher(hidden, heads, head_dim)
     expected_storage_route = torch.randn(heads, head_dim, head_dim)
-    k_heads = []
-    for h in range(heads):
-        a, b = h * head_dim, (h + 1) * head_dim
-        c_math = v[a:b].T
-        # B = C W means q @ W.T is exactly the design's raw query-side factor.
-        k_math = c_math @ expected_storage_route[h]
-        k_heads.append(k_math.T)
-    k = torch.cat(k_heads, dim=0)
-    qkv = torch.cat((q, k, v), dim=0)
+    lambda_actual = (0.125, 0.25)
     student = KeylessAttentionTrain(hidden, heads, head_dim, 1e-5, dtype=torch.float32)
     report = initialize_training_attention_from_native(
         student,
-        qkv_weight=qkv,
-        q_norm_weight=torch.ones(head_dim),
-        k_norm_weight=torch.ones(head_dim),
-        out_proj_weight=torch.randn(hidden, inner),
+        qkv_weight=teacher["qkv"],
+        q_norm_weight=teacher["q_norm"],
+        k_norm_weight=teacher["k_norm"],
+        out_proj_weight=teacher["out"],
         route_mode="least_squares",
-        lambda_relative=0.0,
+        lambda_relative=1e-4,
+        route_storage_weight=expected_storage_route,
+        lambda_actual=lambda_actual,
     )
-    torch.testing.assert_close(
-        student.query_route.weight, expected_storage_route, atol=1e-5, rtol=1e-5
-    )
-    assert report.lambda_actual == (0.0, 0.0)
+    torch.testing.assert_close(student.query_route.weight, expected_storage_route)
+    assert report.mode == "least_squares"
+    assert report.lambda_relative == 1e-4
+    assert report.lambda_actual == lambda_actual
 
 
-def test_zero_lambda_least_squares_handles_rank_deficient_value_projection() -> None:
+def test_least_squares_initialization_rejects_projection_weight_fallback() -> None:
     hidden, heads, head_dim = 5, 1, 3
     inner = heads * head_dim
-    q = torch.randn(inner, hidden)
-    base = torch.randn(1, hidden)
-    v = torch.cat((base, 2 * base, 3 * base), dim=0)
-    k = torch.randn(inner, hidden)
+    teacher = _teacher(hidden, heads, head_dim)
     student = KeylessAttentionTrain(hidden, heads, head_dim, 1e-5, dtype=torch.float32)
-    initialize_training_attention_from_native(
-        student,
-        qkv_weight=torch.cat((q, k, v), dim=0),
-        q_norm_weight=torch.ones(head_dim),
-        k_norm_weight=torch.ones(head_dim),
-        out_proj_weight=torch.randn(hidden, inner),
-        route_mode="least_squares",
-        lambda_relative=0.0,
-    )
-    assert torch.isfinite(student.query_route.weight).all()
+    with pytest.raises(ValueError, match="captured train activations"):
+        initialize_training_attention_from_native(
+            student,
+            qkv_weight=teacher["qkv"],
+            q_norm_weight=teacher["q_norm"],
+            k_norm_weight=teacher["k_norm"],
+            out_proj_weight=torch.randn(hidden, inner),
+            route_mode="least_squares",
+            lambda_relative=0.0,
+        )
 
 
 def test_pilot_freeze_schedule_only_exposes_declared_attention_parameters() -> None:
