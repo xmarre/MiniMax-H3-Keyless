@@ -26,7 +26,7 @@ jobs:
           python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.1
           python -m pip install numpy safetensors pytest
           python -m pip install -e . --no-deps
-      - name: Compile package
-        run: python -m compileall -q minimax_h3_keyless tests
+      - name: Compile package and tools
+        run: python -m compileall -q minimax_h3_keyless tests tools
       - name: Run CPU contract tests
         run: python -m pytest
