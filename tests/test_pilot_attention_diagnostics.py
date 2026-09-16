@@ -5,10 +5,11 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from minimax_h3_keyless.activation_capture import CapturedPilotCase, PilotCase
+from minimax_h3_keyless.activation_capture import CapturedPilotCase
 from minimax_h3_keyless.activation_metrics import streamed_attention_comparison, tensor_error_metrics
 from minimax_h3_keyless.attention import KeylessAttentionTrain
 from minimax_h3_keyless.ops import normalized_positioned
+from minimax_h3_keyless.pilot import PilotCase
 from minimax_h3_keyless.pilot_attention_diagnostics import (
     compare_captured_native_keyless_attention,
     deterministic_query_rows,
@@ -29,12 +30,11 @@ class _NativeAttention(nn.Module):
 
 def _capture(hidden: torch.Tensor, *, segments: list[list[object]]) -> CapturedPilotCase:
     case = PilotCase(
-        case_id="heldout-a",
-        hidden=hidden.clone(),
-        shift=torch.zeros(hidden.shape[-1]),
-        scale=torch.ones(hidden.shape[-1]),
-        gate=torch.zeros(hidden.shape[-1]),
+        x=hidden.clone(),
+        t_emb=torch.zeros(1, hidden.shape[-1]),
+        mod_segments=None,
         rope_freqs=None,
+        case_id="heldout-a",
         sigma=0.5,
         modality_label="mixed",
         context={
@@ -44,10 +44,10 @@ def _capture(hidden: torch.Tensor, *, segments: list[list[object]]) -> CapturedP
         },
     )
     return CapturedPilotCase(
+        block_index=0,
         case=case,
         attention_input=hidden.clone(),
-        attention_output=torch.zeros_like(hidden),
-        block_output=torch.zeros_like(hidden),
+        captured_bytes=int(hidden.numel() * hidden.element_size()),
     )
 
 
@@ -159,6 +159,8 @@ def test_bounded_attention_diagnostic_matches_dense_streamed_oracle() -> None:
     torch.testing.assert_close(torch.tensor(result.pre_out_cosine), pre[1], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(torch.tensor(result.post_out_normalized_rmse), post[0], atol=1e-6, rtol=1e-6)
     torch.testing.assert_close(torch.tensor(result.post_out_cosine), post[1], atol=1e-6, rtol=1e-6)
+    assert direct.teacher_modality_mass is not None
+    assert direct.student_modality_mass is not None
     torch.testing.assert_close(
         torch.tensor(result.teacher_modality_mass),
         direct.teacher_modality_mass.mean(dim=(0, 1)),
