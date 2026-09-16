@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+from pathlib import Path
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from minimax_h3_keyless.attention import KeylessAttentionTrain
 from minimax_h3_keyless.initialization import initialize_training_attention_from_native
 from minimax_h3_keyless.ops import normalized_positioned, torch_sdpa_attention
 from minimax_h3_keyless.pilot import PilotCase, PilotLossWeights, set_pilot_block_stage
+from minimax_h3_keyless.pilot_artifacts import StageAArtifactRequest
 from minimax_h3_keyless.pilot_campaign import GATE_SCHEMA, PilotAggregateMetrics, PilotCaseMetrics
 from minimax_h3_keyless.pilot_capture_set import StageACaptureSet
 from minimax_h3_keyless.pilot_runner import (
@@ -119,10 +121,7 @@ def _capture_set(teacher: TinyBlock):
             def capture_hidden(module, args, kwargs):
                 captured["h"] = args[0].detach().clone()
 
-            handle = teacher.attn.register_forward_pre_hook(
-                capture_hidden,
-                with_kwargs=True,
-            )
+            handle = teacher.attn.register_forward_pre_hook(capture_hidden, with_kwargs=True)
             try:
                 teacher(
                     case.x.detach().clone(),
@@ -221,10 +220,23 @@ def test_initialization_selection_prefers_holdout_attention_error_then_block_err
     assert selected.lambda_relative == 1e-4
 
 
-def test_block_runner_replays_fixed_capture_evaluates_grid_and_records_training() -> None:
+def test_initialization_selection_rejects_duplicate_ls_lambda() -> None:
+    evaluations = (
+        StageAInitializationEvaluation("identity", 0.0, _metric(0.3, 0.1)),
+        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2)),
+        StageAInitializationEvaluation("least_squares", 1e-4, _metric(0.2, 0.15)),
+        StageAInitializationEvaluation("least_squares", 1e-4, _metric(0.1, 0.1)),
+        StageAInitializationEvaluation("least_squares", 1e-2, _metric(0.4, 0.01)),
+    )
+    with pytest.raises(ValueError, match="LS lambdas"):
+        select_stage_a_initialization(evaluations)
+
+
+def test_block_runner_replays_grid_trains_and_persists_immutable_evidence(tmp_path: Path) -> None:
     torch.manual_seed(502)
     teacher = TinyBlock()
     corpus = _capture_set(teacher)
+    request = StageAArtifactRequest(str(tmp_path), "tiny-run", "deadbeef")
     result = run_stage_a_block_pilot(
         teacher,
         corpus,
@@ -234,6 +246,7 @@ def test_block_runner_replays_fixed_capture_evaluates_grid_and_records_training(
         train_plan=(StageATrainStage("route", 1, 2e-3, max_grad_norm=100.0),),
         loss_weights=PilotLossWeights(attention_output=1.0, block_output=1.0),
         student_builder=_builder,
+        artifact_request=request,
     )
     assert len(result.replay_reports) == 4
     assert all(report.attention_input_max_abs_error == 0.0 for report in result.replay_reports)
@@ -247,3 +260,17 @@ def test_block_runner_replays_fixed_capture_evaluates_grid_and_records_training(
     assert result.candidate.case_count == 2
     assert result.gate.block_index == 0
     assert all(torch.isfinite(torch.tensor(event.report.total)) for event in result.training_events)
+    assert result.artifact is not None
+    assert Path(result.artifact.checkpoint_path).exists()
+    assert Path(result.artifact.result_path).exists()
+    with pytest.raises(FileExistsError, match="immutable"):
+        run_stage_a_block_pilot(
+            teacher,
+            corpus,
+            block_index=0,
+            device="cpu",
+            gate_manifest=_gate_manifest(),
+            train_plan=(StageATrainStage("route", 1, 2e-3),),
+            student_builder=_builder,
+            artifact_request=request,
+        )
