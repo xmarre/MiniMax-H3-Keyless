@@ -13,6 +13,10 @@ from .pilot_artifacts import (
     StageAArtifactRequest,
     persist_stage_a_block_artifacts,
 )
+from .pilot_attention_diagnostics import (
+    PilotAttentionDiagnostic,
+    compare_captured_native_keyless_attention,
+)
 from .pilot_campaign import (
     PILOT_BLOCKS,
     PILOT_LS_LAMBDAS,
@@ -60,7 +64,7 @@ class StageATrainStage:
         if self.learning_rate <= 0:
             raise ValueError("Stage-A learning rate must be positive")
         if self.weight_decay < 0:
-            raise ValueError("Stage-A weight decay must be non-negative")
+            raise ValueError("Stage-A weight_decay must be non-negative")
         if self.max_grad_norm is not None and self.max_grad_norm <= 0:
             raise ValueError("Stage-A max_grad_norm must be positive when specified")
 
@@ -71,6 +75,7 @@ class StageAInitializationEvaluation:
     lambda_relative: float
     metrics: PilotAggregateMetrics
     route_fit_diagnostics: RouteActivationFitDiagnostics | None = None
+    attention_diagnostics: tuple[PilotAttentionDiagnostic, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -83,6 +88,7 @@ class StageABlockPilotResult:
     identity_baseline: PilotAggregateMetrics
     least_squares_baseline: PilotAggregateMetrics
     candidate: PilotAggregateMetrics
+    candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...]
     training_events: tuple[PilotTrainingEvent, ...]
     gate: StageABlockGateResult
     artifact: StageAArtifactReceipt | None = None
@@ -182,6 +188,34 @@ def _build_student(
     return student
 
 
+def _evaluate_attention_diagnostics(
+    teacher_block: nn.Module,
+    student_block: nn.Module,
+    records,
+) -> tuple[PilotAttentionDiagnostic, ...]:
+    teacher_attention = getattr(teacher_block, "attn", None)
+    student_attention = getattr(student_block, "attn", None)
+    if teacher_attention is None:
+        raise RuntimeError("Stage-A teacher block is missing attention for diagnostics")
+    if not isinstance(student_attention, KeylessAttentionTrain):
+        raise RuntimeError("Stage-A student block is missing KeylessAttentionTrain diagnostics target")
+    diagnostics = tuple(
+        compare_captured_native_keyless_attention(
+            teacher_attention,
+            student_attention,
+            record,
+        )
+        for record in records
+    )
+    if not diagnostics:
+        raise RuntimeError("Stage-A attention diagnostics require at least one holdout capture")
+    case_ids = tuple(row.case_id for row in diagnostics)
+    expected = tuple(record.case.case_id for record in records)
+    if case_ids != expected:
+        raise RuntimeError("Stage-A attention diagnostic case ordering diverged from holdout captures")
+    return diagnostics
+
+
 def select_stage_a_initialization(
     evaluations: Sequence[StageAInitializationEvaluation],
 ) -> StageAInitializationEvaluation:
@@ -211,6 +245,7 @@ def select_stage_a_initialization(
 def _evaluate_initialization_grid(
     teacher_block: nn.Module,
     holdout_cases,
+    holdout_records,
     *,
     block_index: int,
     device: str | torch.device,
@@ -239,6 +274,9 @@ def _evaluate_initialization_grid(
         student.to(device)
         student.eval()
         metrics = evaluate_pilot_cases(teacher_block, student, holdout_cases, weights=weights)
+        attention_diagnostics = _evaluate_attention_diagnostics(
+            teacher_block, student, holdout_records
+        )
         fit = None if route_mode == "identity" else route_fits[float(lambda_relative)]
         evaluations.append(
             StageAInitializationEvaluation(
@@ -246,6 +284,7 @@ def _evaluate_initialization_grid(
                 lambda_relative=float(lambda_relative),
                 metrics=metrics,
                 route_fit_diagnostics=None if fit is None else fit.diagnostics,
+                attention_diagnostics=attention_diagnostics,
             )
         )
         del student
@@ -272,6 +311,7 @@ def _result_payload(
     identity: StageAInitializationEvaluation,
     best_ls: StageAInitializationEvaluation,
     candidate: PilotAggregateMetrics,
+    candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...],
     events: tuple[PilotTrainingEvent, ...],
     gate: StageABlockGateResult,
 ) -> dict:
@@ -284,6 +324,9 @@ def _result_payload(
         "identity_baseline": asdict(identity.metrics),
         "least_squares_baseline": asdict(best_ls.metrics),
         "candidate": asdict(candidate),
+        "candidate_attention_diagnostics": [
+            asdict(row) for row in candidate_attention_diagnostics
+        ],
         "training_events": [asdict(row) for row in events],
         "gate": asdict(gate),
     }
@@ -307,8 +350,11 @@ def run_stage_a_block_pilot(
     """Run one bounded Stage-A depth pilot from immutable live captures.
 
     Initialization is selected only from the fixed holdout corpus. LS route fitting uses
-    only captured post-AdaLN train activations. Training follows the predeclared monotonic
-    freeze schedule and creates a fresh optimizer after every transition. If
+    only captured post-AdaLN train activations. Bounded complete-key attention diagnostics
+    are recorded for every initialization and for the final held-out candidate, but remain
+    secondary evidence: initialization selection and the predeclared gate continue to use
+    the primary same-input attention/block output metrics. Training follows the predeclared
+    monotonic freeze schedule and creates a fresh optimizer after every transition. If
     ``artifact_request`` is supplied, the final training-form block, optimizer/RNG state
     and all numerical evidence are persisted under immutable names. A failed numerical
     gate is still persisted as evidence; it is never relabeled as an accepted pilot.
@@ -353,6 +399,7 @@ def run_stage_a_block_pilot(
     evaluations, selected, best_ls = _evaluate_initialization_grid(
         teacher_block,
         holdout_cases,
+        holdout_records,
         block_index=block_index,
         device=device,
         weights=loss_weights,
@@ -393,6 +440,9 @@ def run_stage_a_block_pilot(
     assert optimizer is not None
 
     candidate = evaluate_pilot_cases(teacher_block, student, holdout_cases, weights=loss_weights)
+    candidate_attention_diagnostics = _evaluate_attention_diagnostics(
+        teacher_block, student, holdout_records
+    )
     event_tuple = tuple(events)
     gate = evaluate_stage_a_block_gate(
         block_index=block_index,
@@ -428,6 +478,7 @@ def run_stage_a_block_pilot(
                 identity=identity,
                 best_ls=best_ls,
                 candidate=candidate,
+                candidate_attention_diagnostics=candidate_attention_diagnostics,
                 events=event_tuple,
                 gate=gate,
             ),
@@ -441,6 +492,7 @@ def run_stage_a_block_pilot(
         identity_baseline=identity.metrics,
         least_squares_baseline=best_ls.metrics,
         candidate=candidate,
+        candidate_attention_diagnostics=candidate_attention_diagnostics,
         training_events=event_tuple,
         gate=gate,
         artifact=artifact,
