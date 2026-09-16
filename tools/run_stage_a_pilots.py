@@ -9,7 +9,7 @@ from minimax_h3_keyless.checkpoint import sha256_file
 from minimax_h3_keyless.contracts import TEACHER_SHA256
 from minimax_h3_keyless.immutable_io import write_json_no_replace
 from minimax_h3_keyless.live_capture import discover_clean_git_revision
-from minimax_h3_keyless.pilot_artifacts import StageAArtifactRequest
+from minimax_h3_keyless.pilot_artifacts import STAGE_A_RESULT_SCHEMA, StageAArtifactRequest
 from minimax_h3_keyless.pilot_campaign import (
     load_json_manifest,
     validate_pilot_gate_manifest,
@@ -24,10 +24,11 @@ from minimax_h3_keyless.pilot_inputs import (
     stage_a_experiment_context_sha256,
 )
 from minimax_h3_keyless.pilot_runner import run_stage_a_block_pilot
+from minimax_h3_keyless.stage_a_campaign_result import (
+    STAGE_A_CAMPAIGN_RESULT_SCHEMA,
+    load_stage_a_campaign_evidence,
+)
 from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
-
-
-CAMPAIGN_RESULT_SCHEMA = "minimax_h3_keyless_stage_a_campaign_result_v1"
 
 
 def _require_training_source_provenance(claimed_code_commit: str, capture_comfy_commit: str) -> str:
@@ -93,9 +94,6 @@ def main() -> int:
     registry = load_stage_a_capture_registry(args.capture_registry)
     plan = load_stage_a_run_plan(args.train_plan)
 
-    # Stage-A captures are potentially multi-GiB at native H3 sequence lengths. Index and
-    # hash-validate the whole corpus without retaining activation tensors, then materialize
-    # only the requested pilot depth inside each sequential block run.
     capture_set = load_stage_a_capture_set_lazy(
         registry.artifacts,
         dataset,
@@ -186,7 +184,8 @@ def main() -> int:
 
     campaign_gate = evaluate_stage_a_campaign_gate(gates)
     payload = {
-        "schema": CAMPAIGN_RESULT_SCHEMA,
+        "schema": STAGE_A_CAMPAIGN_RESULT_SCHEMA,
+        "stage_a_block_result_schema": STAGE_A_RESULT_SCHEMA,
         "run_id": args.run_id,
         "code_commit": args.code_commit.lower(),
         "training_comfy_commit": training_comfy_commit,
@@ -200,6 +199,7 @@ def main() -> int:
         "capture_code_commit": capture_set.code_commit,
         "capture_comfy_commit": capture_set.comfy_commit,
         "capture_execution_descriptor": capture_set.execution_descriptor,
+        "final_stage": final_stage,
         "resumed_blocks": resumed_blocks,
         "executed_blocks": executed_blocks,
         "block_artifacts": {
@@ -213,10 +213,18 @@ def main() -> int:
         raise FileExistsError(
             f"Stage-A campaign result is immutable; choose a new run_id: {campaign_result_path}"
         ) from exc
+
+    validated = load_stage_a_campaign_evidence(
+        campaign_result_path,
+        gate_manifest=gate_manifest,
+        require_passed=False,
+    )
+    if validated.sha256.lower() != campaign_sha.lower():
+        raise RuntimeError("Stage-A campaign result hash changed during validation")
     print(f"Stage-A campaign result: {campaign_result_path}")
     print(f"Stage-A campaign result SHA-256: {campaign_sha}")
-    print(f"Stage-A campaign gate passed: {campaign_gate.passed}")
-    return 0 if campaign_gate.passed else 2
+    print(f"Stage-A campaign gate passed: {validated.gate.passed}")
+    return 0 if validated.gate.passed else 2
 
 
 if __name__ == "__main__":
