@@ -13,6 +13,7 @@ from minimax_h3_keyless.export import (
     export_folded_bf16,
     manifest_identity_sha256,
 )
+from minimax_h3_keyless.teacher_compat import TeacherCompatibilityReport
 
 
 def test_manifest_identity_is_mapping_order_independent() -> None:
@@ -48,6 +49,7 @@ def test_export_receipt_binds_metadata_manifest_and_artifact_sha(tmp_path: Path,
     assert result.artifact_sha256 == sha256_file(path)
     assert result.artifact_bytes == path.stat().st_size
     assert result.tensor_count == 2
+    assert result.teacher_compatibility_checked is False
     with safe_open(str(path), framework="pt", device="cpu") as f:
         md = dict(f.metadata() or {})
     assert md["manifest_sha256"] == result.manifest_identity_sha256
@@ -58,9 +60,45 @@ def test_export_receipt_binds_metadata_manifest_and_artifact_sha(tmp_path: Path,
     assert result.manifest_sha256 == sha256_file(result.manifest_path)
 
 
+def test_export_records_teacher_compatibility_in_hashed_manifest(tmp_path: Path, monkeypatch) -> None:
+    folded = {"weight": torch.ones(2, 2, dtype=torch.bfloat16)}
+    monkeypatch.setattr(export_mod, "fold_training_state_dict", lambda state, output_dtype: folded)
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
+
+    import minimax_h3_keyless.teacher_compat as compat
+
+    monkeypatch.setattr(
+        compat,
+        "validate_deploy_mapping_against_teacher",
+        lambda path, tensors: TeacherCompatibilityReport(
+            teacher_sha256="a" * 64,
+            teacher_tensor_count=10,
+            deploy_tensor_count=10,
+            exact_copy_tensor_count=8,
+            mutable_core_tensor_count=2,
+        ),
+    )
+    metadata = {
+        "parent_model_sha256": "a" * 64,
+        "parent_model_revision": export_mod.TARGET_MODEL_REVISION,
+    }
+    result = export_folded_bf16(
+        {},
+        tmp_path / "student.safetensors",
+        metadata=metadata,
+        teacher_path=tmp_path / "teacher.safetensors",
+    )
+    assert result.teacher_compatibility_checked is True
+    receipt = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    evidence = receipt["extra"]["teacher_compatibility"]
+    assert evidence["status"] == "passed"
+    assert evidence["exact_copy_tensor_count"] == 8
+
+
 def test_export_rejects_predeclared_wrong_manifest_identity(tmp_path: Path, monkeypatch) -> None:
     folded = {"weight": torch.ones(2, 2, dtype=torch.bfloat16)}
     monkeypatch.setattr(export_mod, "fold_training_state_dict", lambda state, output_dtype: folded)
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
     with torch.no_grad():
         try:
             export_folded_bf16(

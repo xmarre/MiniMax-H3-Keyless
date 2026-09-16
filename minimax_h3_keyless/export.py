@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,6 +35,7 @@ class ExportResult:
     manifest_sha256: str
     manifest_identity_sha256: str
     tensor_count: int
+    teacher_compatibility_checked: bool
 
 
 def fold_query_route_weight(
@@ -161,8 +162,14 @@ def export_folded_bf16(
     manifest_path: str | Path | None = None,
     command: str | None = None,
     manifest_extra: Mapping[str, Any] | None = None,
+    teacher_path: str | Path | None = None,
 ) -> ExportResult:
     """Write folded BF16 plus a deterministic provenance/tensor receipt.
+
+    Passing ``teacher_path`` enables the canonical full-compatibility gate: every key and
+    signature must be the exact native-QKV -> Keyless-QV transformation, and every tensor
+    outside the design-authorized core-attention trainable set must remain byte-identical
+    to the pinned BF16 teacher. Release exports must use this gate.
 
     The sidecar has two layers to avoid a hash cycle: the deterministic manifest body
     is hashed first and that identity is embedded as ``manifest_sha256`` in the
@@ -173,12 +180,35 @@ def export_folded_bf16(
     output_path = Path(output_path)
     folded = fold_training_state_dict(state_dict, output_dtype=torch.bfloat16)
     base_metadata = {k: str(v) for k, v in metadata.items() if k != "manifest_sha256"}
+    validate_deploy_checkpoint(folded, base_metadata)
+
+    body_extra = dict(manifest_extra or {})
+    compatibility_checked = teacher_path is not None
+    if teacher_path is not None:
+        if "teacher_compatibility" in body_extra:
+            raise ValueError("manifest_extra may not override reserved teacher_compatibility evidence")
+        from .teacher_compat import validate_deploy_mapping_against_teacher
+
+        report = validate_deploy_mapping_against_teacher(teacher_path, folded)
+        if base_metadata.get("parent_model_sha256", "").lower() != report.teacher_sha256.lower():
+            raise ValueError(
+                "export metadata parent_model_sha256 does not match the teacher used by the compatibility gate"
+            )
+        if base_metadata.get("parent_model_revision") != TARGET_MODEL_REVISION:
+            raise ValueError(
+                "export metadata parent_model_revision does not match the pinned teacher revision"
+            )
+        body_extra["teacher_compatibility"] = {
+            **asdict(report),
+            "status": "passed",
+        }
+
     body = build_export_manifest_body(
         folded,
         artifact_filename=output_path.name,
         metadata=base_metadata,
         command=command,
-        extra=manifest_extra,
+        extra=body_extra or None,
     )
     identity = manifest_identity_sha256(body)
     supplied_identity = metadata.get("manifest_sha256")
@@ -215,4 +245,5 @@ def export_folded_bf16(
         manifest_sha256=sidecar_sha,
         manifest_identity_sha256=identity,
         tensor_count=len(folded),
+        teacher_compatibility_checked=compatibility_checked,
     )
