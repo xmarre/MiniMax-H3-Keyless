@@ -106,6 +106,7 @@ def _capture_set(teacher: TinyBlock):
     for split, target in (("train", train), ("holdout", holdout)):
         for n, sigma in enumerate((0.2, 0.8)):
             x = torch.randn(5, 4)
+            segments = [[0, 5, "video"]] if n == 0 else [[0, 2, "audio"], [2, 5, "video"]]
             case = PilotCase(
                 x=x,
                 t_emb=torch.zeros(1, 1),
@@ -115,7 +116,12 @@ def _capture_set(teacher: TinyBlock):
                 case_id=f"{split}-{n}::sigma={sigma}",
                 sigma=sigma,
                 modality_label="video" if n == 0 else "audio-video",
-                context={"stage_a_split": split},
+                context={
+                    "stage_a_split": split,
+                    "minimax_h3_keyless_live_capture_v1": {
+                        "layout": {"seq_len": 5, "segments": segments}
+                    },
+                },
             )
             captured = {}
 
@@ -289,6 +295,7 @@ def test_block_runner_replays_grid_trains_and_persists_immutable_evidence(tmp_pa
     assert len(result.replay_reports) == 4
     assert all(report.attention_input_max_abs_error == 0.0 for report in result.replay_reports)
     assert len(result.initialization_evaluations) == 4
+    assert all(len(row.attention_diagnostics) == 2 for row in result.initialization_evaluations)
     ls_rows = [
         row for row in result.initialization_evaluations if row.route_mode == "least_squares"
     ]
@@ -297,6 +304,9 @@ def test_block_runner_replays_grid_trains_and_persists_immutable_evidence(tmp_pa
     assert all(row.route_fit_diagnostics.rows == 10 for row in ls_rows)
     assert len(result.training_events) == 2
     assert result.candidate.case_count == 2
+    assert len(result.candidate_attention_diagnostics) == 2
+    assert result.candidate_attention_diagnostics[0].modality_kinds == ("video",)
+    assert result.candidate_attention_diagnostics[1].modality_kinds == ("audio", "video")
     assert result.gate.block_index == 0
     assert all(torch.isfinite(torch.tensor(event.report.total)) for event in result.training_events)
     assert result.artifact is not None
