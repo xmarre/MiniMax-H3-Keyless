@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
+import torch
 from safetensors import safe_open
 
 from .contracts import (
@@ -18,6 +19,7 @@ from .contracts import (
     HEADS,
     HIDDEN_SIZE,
     INNER_DIM,
+    QUANTIZATION_RECIPE,
     QV_ORDER,
     ROPE_POLICY,
     TARGET_MODEL_REVISION,
@@ -49,13 +51,31 @@ class ValidationReport:
 
 
 def _shape(value: Any) -> tuple[int, ...]:
-    if hasattr(value, "shape"):
-        return tuple(int(x) for x in value.shape)
     if isinstance(value, TensorSignature):
         return value.shape
+    if hasattr(value, "shape"):
+        return tuple(int(x) for x in value.shape)
     if isinstance(value, (tuple, list)):
         return tuple(int(x) for x in value)
     raise TypeError(f"cannot determine shape for {type(value)!r}")
+
+
+def _dtype_name(value: Any) -> str:
+    if isinstance(value, TensorSignature):
+        return value.dtype.upper()
+    dtype = getattr(value, "dtype", None)
+    mapping = {
+        torch.bfloat16: "BF16",
+        torch.float32: "F32",
+        torch.float16: "F16",
+        torch.int8: "I8",
+        torch.uint8: "U8",
+    }
+    if dtype in mapping:
+        return mapping[dtype]
+    if dtype is None:
+        raise TypeError(f"cannot determine dtype for {type(value)!r}")
+    return str(dtype).replace("torch.", "").upper()
 
 
 def _require_shape(tensors: Mapping[str, Any], key: str, expected: tuple[int, ...]) -> None:
@@ -64,6 +84,14 @@ def _require_shape(tensors: Mapping[str, Any], key: str, expected: tuple[int, ..
     actual = _shape(tensors[key])
     if actual != expected:
         raise CheckpointValidationError(f"{key}: expected shape {expected}, got {actual}")
+
+
+def _require_dtype(tensors: Mapping[str, Any], key: str, expected: str) -> None:
+    if key not in tensors:
+        raise CheckpointValidationError(f"missing required tensor: {key}")
+    actual = _dtype_name(tensors[key])
+    if actual != expected:
+        raise CheckpointValidationError(f"{key}: expected dtype {expected}, got {actual}")
 
 
 def _metadata_int(metadata: Mapping[str, Any], key: str) -> int:
@@ -166,6 +194,80 @@ def validate_deploy_checkpoint(
         forbidden_key_count=0,
         tensor_count=len(tensors),
     )
+
+
+def _int8_target_shapes() -> dict[str, tuple[int, int]]:
+    shapes: dict[str, tuple[int, int]] = {}
+    for i in range(CORE_BLOCKS):
+        shapes[f"blocks.{i}.attn.qv_proj.weight"] = (2 * INNER_DIM, HIDDEN_SIZE)
+        shapes[f"blocks.{i}.attn.out_proj.weight"] = (HIDDEN_SIZE, INNER_DIM)
+        shapes[f"blocks.{i}.mlp.fc1.weight"] = (4 * INNER_DIM, HIDDEN_SIZE)
+        shapes[f"blocks.{i}.mlp.fc2.weight"] = (HIDDEN_SIZE, 2 * INNER_DIM)
+    return shapes
+
+
+def validate_int8_convrot_checkpoint(
+    tensors: Mapping[str, Any], metadata: Mapping[str, Any]
+) -> ValidationReport:
+    """Validate the exact native Comfy core50/200 INT8 ConvRot storage contract."""
+    report = validate_deploy_checkpoint(tensors, metadata)
+    if metadata.get("quantization_recipe") != QUANTIZATION_RECIPE:
+        raise CheckpointValidationError(
+            f"quantization_recipe must be {QUANTIZATION_RECIPE!r}"
+        )
+    if metadata.get("quantization_format") != "int8_tensorwise":
+        raise CheckpointValidationError("quantization_format must be 'int8_tensorwise'")
+    if metadata.get("quantization_convrot") != "true":
+        raise CheckpointValidationError("quantization_convrot must be 'true'")
+    if _metadata_int(metadata, "quantization_convrot_groupsize") != 256:
+        raise CheckpointValidationError("quantization_convrot_groupsize must be 256")
+    if _metadata_int(metadata, "quantized_linear_count") != CORE_BLOCKS * 4:
+        raise CheckpointValidationError("quantized_linear_count must be 200")
+
+    target_shapes = _int8_target_shapes()
+    expected_descriptors: set[str] = set()
+    expected_scales: set[str] = set()
+    for weight_key, shape in target_shapes.items():
+        _require_shape(tensors, weight_key, shape)
+        _require_dtype(tensors, weight_key, "I8")
+        scale_key = weight_key + "_scale"
+        descriptor_key = weight_key.removesuffix(".weight") + ".comfy_quant"
+        expected_scales.add(scale_key)
+        expected_descriptors.add(descriptor_key)
+        if scale_key not in tensors:
+            raise CheckpointValidationError(f"missing required tensor: {scale_key}")
+        scale_shape = _shape(tensors[scale_key])
+        if scale_shape not in ((shape[0],), (shape[0], 1)):
+            raise CheckpointValidationError(
+                f"{scale_key}: expected one F32 scale per output row, got {scale_shape}"
+            )
+        _require_dtype(tensors, scale_key, "F32")
+        if descriptor_key not in tensors:
+            raise CheckpointValidationError(f"missing required tensor: {descriptor_key}")
+        descriptor_shape = _shape(tensors[descriptor_key])
+        if len(descriptor_shape) != 1 or descriptor_shape[0] <= 0:
+            raise CheckpointValidationError(
+                f"{descriptor_key}: expected non-empty U8 JSON descriptor, got {descriptor_shape}"
+            )
+        _require_dtype(tensors, descriptor_key, "U8")
+
+    actual_descriptors = {k for k in tensors if k.endswith(".comfy_quant")}
+    actual_scales = {k for k in tensors if k.endswith(".weight_scale")}
+    if actual_descriptors != expected_descriptors:
+        missing = sorted(expected_descriptors - actual_descriptors)
+        extra = sorted(actual_descriptors - expected_descriptors)
+        raise CheckpointValidationError(
+            "native quant descriptor set is not exactly the core50/200 recipe: "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    if actual_scales != expected_scales:
+        missing = sorted(expected_scales - actual_scales)
+        extra = sorted(actual_scales - expected_scales)
+        raise CheckpointValidationError(
+            "INT8 scale set is not exactly the core50/200 recipe: "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    return report
 
 
 def validate_training_checkpoint(tensors: Mapping[str, Any], *, require_pruned_adaln: bool = True) -> None:

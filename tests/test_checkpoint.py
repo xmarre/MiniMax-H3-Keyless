@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-from copy import deepcopy
-
 from minimax_h3_keyless.checkpoint import (
     CheckpointValidationError,
     TensorSignature,
     validate_deploy_checkpoint,
+    validate_int8_convrot_checkpoint,
     validate_training_checkpoint,
 )
 from minimax_h3_keyless.contracts import (
@@ -17,13 +16,14 @@ from minimax_h3_keyless.contracts import (
     HEADS,
     HIDDEN_SIZE,
     INNER_DIM,
+    QUANTIZATION_RECIPE,
     TOKEN_REFINER_BLOCKS,
 )
 from minimax_h3_keyless.export import canonical_metadata
 
 
-def _sig(*shape: int) -> TensorSignature:
-    return TensorSignature(tuple(shape), "BF16")
+def _sig(*shape: int, dtype: str = "BF16") -> TensorSignature:
+    return TensorSignature(tuple(shape), dtype)
 
 
 def _common() -> dict[str, TensorSignature]:
@@ -63,6 +63,33 @@ def _training() -> dict[str, TensorSignature]:
         tensors[p + "route_norm.weight"] = _sig(HEAD_DIM)
         tensors[p + "out_proj.weight"] = _sig(HIDDEN_SIZE, INNER_DIM)
     return tensors
+
+
+def _int8_deploy() -> tuple[dict[str, TensorSignature], dict[str, str]]:
+    tensors = _deploy()
+    for i in range(CORE_BLOCKS):
+        shapes = {
+            f"blocks.{i}.attn.qv_proj.weight": (2 * INNER_DIM, HIDDEN_SIZE),
+            f"blocks.{i}.attn.out_proj.weight": (HIDDEN_SIZE, INNER_DIM),
+            f"blocks.{i}.mlp.fc1.weight": (4 * INNER_DIM, HIDDEN_SIZE),
+            f"blocks.{i}.mlp.fc2.weight": (HIDDEN_SIZE, 2 * INNER_DIM),
+        }
+        for weight_key, shape in shapes.items():
+            tensors[weight_key] = _sig(*shape, dtype="I8")
+            tensors[weight_key + "_scale"] = _sig(shape[0], 1, dtype="F32")
+            descriptor_key = weight_key.removesuffix(".weight") + ".comfy_quant"
+            tensors[descriptor_key] = _sig(64, dtype="U8")
+    metadata = canonical_metadata(training_run="test", export_commit="deadbeef")
+    metadata.update(
+        {
+            "quantization_recipe": QUANTIZATION_RECIPE,
+            "quantization_format": "int8_tensorwise",
+            "quantization_convrot": "true",
+            "quantization_convrot_groupsize": "256",
+            "quantized_linear_count": "200",
+        }
+    )
+    return tensors, metadata
 
 
 def test_valid_deploy_signature_is_accepted() -> None:
@@ -109,6 +136,36 @@ def test_deploy_rejects_wrong_metadata_identity() -> None:
         assert "qv_order" in str(exc)
     else:
         raise AssertionError("wrong QV ordering metadata must be rejected")
+
+
+def test_valid_int8_core50_200_signature_is_accepted() -> None:
+    tensors, metadata = _int8_deploy()
+    report = validate_int8_convrot_checkpoint(tensors, metadata)
+    assert report.core_blocks == 50
+    assert len([k for k in tensors if k.endswith(".comfy_quant")]) == 200
+    assert len([k for k in tensors if k.endswith(".weight_scale")]) == 200
+
+
+def test_int8_rejects_wrong_per_output_row_scale_shape() -> None:
+    tensors, metadata = _int8_deploy()
+    tensors["blocks.0.attn.qv_proj.weight_scale"] = _sig(2 * INNER_DIM, 2, dtype="F32")
+    try:
+        validate_int8_convrot_checkpoint(tensors, metadata)
+    except CheckpointValidationError as exc:
+        assert "one F32 scale per output row" in str(exc)
+    else:
+        raise AssertionError("invalid ConvRot scale geometry must be rejected")
+
+
+def test_int8_rejects_stray_quant_descriptor_outside_200_recipe() -> None:
+    tensors, metadata = _int8_deploy()
+    tensors["token_refiner.blocks.0.attn.qkv_proj.comfy_quant"] = _sig(64, dtype="U8")
+    try:
+        validate_int8_convrot_checkpoint(tensors, metadata)
+    except CheckpointValidationError as exc:
+        assert "exactly the core50/200 recipe" in str(exc)
+    else:
+        raise AssertionError("stray token-refiner quantization must be rejected")
 
 
 def test_training_signature_rejects_deploy_projection() -> None:
