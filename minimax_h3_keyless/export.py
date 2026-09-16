@@ -24,6 +24,7 @@ from .contracts import (
     TEACHER_SHA256,
     TOKEN_REFINER_BLOCKS,
 )
+from .teacher_compat import TEACHER_COMPATIBILITY_MARKER
 
 
 @dataclass(frozen=True)
@@ -198,6 +199,7 @@ def export_folded_bf16(
             raise ValueError(
                 "export metadata parent_model_revision does not match the pinned teacher revision"
             )
+        base_metadata["teacher_compatibility"] = TEACHER_COMPATIBILITY_MARKER
         body_extra["teacher_compatibility"] = {
             **asdict(report),
             "status": "passed",

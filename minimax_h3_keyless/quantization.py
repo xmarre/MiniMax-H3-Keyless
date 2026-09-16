@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import string
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -16,8 +17,16 @@ from .checkpoint import (
     validate_deploy_checkpoint,
     validate_int8_convrot_checkpoint,
 )
-from .contracts import CORE_BLOCKS, HIDDEN_SIZE, INNER_DIM, QUANTIZATION_RECIPE
+from .contracts import (
+    CORE_BLOCKS,
+    HIDDEN_SIZE,
+    INNER_DIM,
+    QUANTIZATION_RECIPE,
+    TARGET_MODEL_REVISION,
+    TEACHER_SHA256,
+)
 from .export import build_export_manifest_body, manifest_identity_sha256
+from .teacher_compat import TEACHER_COMPATIBILITY_MARKER
 
 
 QUANTIZATION_FORMAT = "int8_tensorwise"
@@ -130,9 +139,42 @@ def quantize_convrot_weight(
     )
 
 
+def _is_sha256(value: str | None) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(ch in string.hexdigits for ch in value)
+    )
+
+
+def _require_accepted_bf16_metadata(metadata: Mapping[str, str]) -> str:
+    if metadata.get("teacher_compatibility") != TEACHER_COMPATIBILITY_MARKER:
+        raise RuntimeError(
+            "INT8 ConvRot source is not marked as a pinned-teacher-compatible folded BF16 export"
+        )
+    if metadata.get("parent_model_sha256", "").lower() != TEACHER_SHA256:
+        raise RuntimeError("INT8 ConvRot source parent_model_sha256 is not the pinned BF16 teacher")
+    if metadata.get("parent_model_revision") != TARGET_MODEL_REVISION:
+        raise RuntimeError("INT8 ConvRot source parent_model_revision is not the pinned teacher revision")
+    manifest_identity = metadata.get("manifest_sha256")
+    if not _is_sha256(manifest_identity):
+        raise RuntimeError("INT8 ConvRot source is missing a valid BF16 export manifest identity")
+    if any(
+        key in metadata
+        for key in (
+            "quantization_format",
+            "quantization_layer_recipe",
+            "quantization_layer_count",
+        )
+    ):
+        raise RuntimeError("INT8 ConvRot source metadata already declares a quantized artifact")
+    return str(manifest_identity).lower()
+
+
 def _source_preflight(
     signatures: Mapping[str, TensorSignature], metadata: Mapping[str, str]
 ) -> tuple[str, ...]:
+    _require_accepted_bf16_metadata(metadata)
     validate_deploy_checkpoint(signatures, metadata)
     targets = quantized_linear_weight_keys()
     shapes = expected_quantized_linear_shapes()
@@ -180,6 +222,29 @@ def _compare_source_and_quantized_signatures(
             )
 
 
+def _validate_nonquantized_values(
+    source_path: str | Path,
+    output_path: str | Path,
+    source_signatures: Mapping[str, TensorSignature],
+) -> int:
+    targets = set(quantized_linear_weight_keys())
+    exact_keys = sorted(
+        set(source_signatures).difference(targets).difference(OMIT_FROM_QUANTIZED_DERIVATIVE)
+    )
+    with safe_open(str(source_path), framework="pt", device="cpu") as source, safe_open(
+        str(output_path), framework="pt", device="cpu"
+    ) as output:
+        for key in exact_keys:
+            source_tensor = source.get_tensor(key)
+            output_tensor = output.get_tensor(key)
+            if not torch.equal(source_tensor, output_tensor):
+                raise RuntimeError(
+                    f"non-quantized tensor changed while producing INT8 ConvRot artifact: {key}"
+                )
+            del source_tensor, output_tensor
+    return len(exact_keys)
+
+
 def _descriptor_key(weight_key: str) -> str:
     return weight_key.removesuffix(".weight") + ".comfy_quant"
 
@@ -225,6 +290,7 @@ def export_int8_convrot_from_bf16(
     source_path = Path(source_path)
     output_path = Path(output_path)
     signatures, source_metadata = read_safetensors_signatures(source_path)
+    source_manifest_identity = _require_accepted_bf16_metadata(source_metadata)
     targets = set(_source_preflight(signatures, source_metadata))
     source_sha = sha256_file(source_path)
     device = torch.device(quantize_device)
@@ -258,6 +324,7 @@ def export_int8_convrot_from_bf16(
             "quantization_convrot": "true",
             "quantization_convrot_groupsize": str(CONVROT_GROUPSIZE),
             "quantization_source_bf16_sha256": source_sha,
+            "quantization_source_bf16_manifest_sha256": source_manifest_identity,
             "export_commit": str(export_commit),
         }
     )
@@ -266,6 +333,7 @@ def export_int8_convrot_from_bf16(
         {
             "source_bf16_path": source_path.name,
             "source_bf16_sha256": source_sha,
+            "source_bf16_manifest_sha256": source_manifest_identity,
             "quantization_recipe": QUANTIZATION_RECIPE,
             "quantization_device_type": device.type,
             "stochastic_rounding": 0,
@@ -290,6 +358,7 @@ def export_int8_convrot_from_bf16(
     output_signatures, output_metadata = read_safetensors_signatures(output_path)
     validate_int8_convrot_checkpoint(output_signatures, output_metadata)
     _compare_source_and_quantized_signatures(signatures, output_signatures)
+    exact_count = _validate_nonquantized_values(source_path, output_path, signatures)
     _validate_descriptor_payloads(output_path)
 
     artifact_sha = sha256_file(output_path)
@@ -298,6 +367,7 @@ def export_int8_convrot_from_bf16(
     receipt["manifest_sha256"] = identity
     receipt["artifact_sha256"] = artifact_sha
     receipt["artifact_bytes"] = artifact_bytes
+    receipt["nonquantized_exact_copy_tensor_count"] = exact_count
     if manifest_path is None:
         manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
     manifest_path = Path(manifest_path)

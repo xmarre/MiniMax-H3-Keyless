@@ -18,6 +18,9 @@ from .contracts import (
 )
 
 
+TEACHER_COMPATIBILITY_MARKER = "pinned_exact_copy_v1"
+
+
 class TeacherCompatibilityError(ValueError):
     pass
 
@@ -212,6 +215,10 @@ def validate_deploy_artifact_against_teacher(
     if metadata.get("parent_model_revision") != TARGET_MODEL_REVISION:
         raise TeacherCompatibilityError(
             "deploy parent_model_revision does not identify the pinned teacher revision"
+        )
+    if metadata.get("teacher_compatibility") != TEACHER_COMPATIBILITY_MARKER:
+        raise TeacherCompatibilityError(
+            "deploy artifact is missing the canonical pinned-teacher compatibility marker"
         )
 
     teacher_sig, _ = read_safetensors_signatures(teacher_path)
