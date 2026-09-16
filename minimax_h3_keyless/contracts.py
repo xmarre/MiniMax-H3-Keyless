@@ -139,14 +139,49 @@ def _selector_indices(selector: Selector, rows: int, device: torch.device) -> to
         start, stop, step = selector.indices(rows)
         if step != 1:
             raise ValueError("Keyless row-domain slices must be contiguous (step=1)")
-        return torch.arange(start, stop, device=device, dtype=torch.long)
-    if torch.is_tensor(selector):
+        idx = torch.arange(start, stop, device=device, dtype=torch.long)
+    elif torch.is_tensor(selector):
         if selector.dtype == torch.bool:
             if selector.ndim != 1 or selector.numel() != rows:
                 raise ValueError("boolean row selector must match the current value domain")
-            return selector.nonzero(as_tuple=False).flatten().to(device=device)
-        return selector.to(device=device, dtype=torch.long).flatten()
-    return torch.tensor(tuple(selector), device=device, dtype=torch.long)
+            idx = selector.nonzero(as_tuple=False).flatten().to(device=device)
+        else:
+            idx = selector.to(device=device, dtype=torch.long).flatten()
+    else:
+        idx = torch.tensor(tuple(selector), device=device, dtype=torch.long)
+    if idx.numel() and (bool((idx < 0).any()) or bool((idx >= rows).any())):
+        raise IndexError(f"row selector contains an index outside [0,{rows})")
+    return idx
+
+
+def _compose_row_domain(
+    domain: RowDomain | None,
+    local_indices: tuple[int, ...],
+    *,
+    current_rows: int,
+    identity: str | None,
+) -> RowDomain:
+    """Map a selection through an existing domain instead of resetting to local indices."""
+    inherited_identity = None if domain is None else domain.identity
+    next_identity = inherited_identity if identity is None else identity
+    if domain is None:
+        mapped = local_indices
+    elif domain.indices is not None:
+        if len(domain.indices) != current_rows:
+            raise ValueError(
+                "explicit row-domain length must match the current physical value rows"
+            )
+        mapped = tuple(domain.indices[i] for i in local_indices)
+    elif domain.start is not None:
+        assert domain.stop is not None
+        if domain.stop - domain.start != current_rows:
+            raise ValueError(
+                "slice row-domain length must match the current physical value rows"
+            )
+        mapped = tuple(domain.start + i for i in local_indices)
+    else:
+        mapped = local_indices
+    return RowDomain(indices=mapped, identity=next_identity)
 
 
 @dataclass(frozen=True)
@@ -182,26 +217,45 @@ class RoutingSpecV1:
         log_measure: torch.Tensor | None = None,
         identity: str | None = None,
     ) -> tuple[torch.Tensor, "RoutingSpecV1", torch.Tensor | None]:
-        """Select V once and carry the same row selection into routing positions/measure."""
+        """Select V once and carry the same row selection into routing positions/measure.
+
+        Domain coordinates are composed through prior selections. This is required for
+        repeated sparse gathers: a second selector is local to the current tensor but
+        provider/cache identities must continue to describe the original logical rows.
+        """
         if v.ndim < 1:
             raise ValueError("V must have a row dimension")
-        idx = _selector_indices(selector, v.shape[0], v.device)
+        rows = int(v.shape[0])
+        idx = _selector_indices(selector, rows, v.device)
         selected_v = v.index_select(0, idx)
         selected_rope = self.rope_freqs
         if selected_rope is not None:
+            if selected_rope.ndim < 2 or selected_rope.shape[1] != rows:
+                raise ValueError("rope_freqs must align exactly with the current value rows")
             selected_rope = selected_rope.index_select(1, idx.to(selected_rope.device))
         selected_measure = log_measure
         if selected_measure is not None:
-            if selected_measure.ndim != 1 or selected_measure.shape[0] != v.shape[0]:
+            if selected_measure.ndim != 1 or selected_measure.shape[0] != rows:
                 raise ValueError("log_measure must align exactly with the pre-selection V domain")
             selected_measure = selected_measure.index_select(0, idx.to(selected_measure.device))
-        indices = tuple(int(x) for x in idx.detach().cpu().tolist())
-        domain = RowDomain(indices=indices, identity=identity)
+        local_indices = tuple(int(x) for x in idx.detach().cpu().tolist())
+        value_domain = _compose_row_domain(
+            self.value_domain,
+            local_indices,
+            current_rows=rows,
+            identity=identity,
+        )
+        routing_position_domain = _compose_row_domain(
+            self.routing_position_domain,
+            local_indices,
+            current_rows=rows,
+            identity=identity,
+        )
         return selected_v, replace(
             self,
             rope_freqs=selected_rope,
-            value_domain=domain,
-            routing_position_domain=domain,
+            value_domain=value_domain,
+            routing_position_domain=routing_position_domain,
         ), selected_measure
 
 
