@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import torch
 
-from .minimax_h3_keyless.loader import load_keyless_model
+if __package__:
+    from .minimax_h3_keyless.loader import load_keyless_model
+else:
+    # Pytest and other repository tooling can import this ComfyUI entry point as
+    # a top-level module. Keep that mode explicit rather than catching ImportError,
+    # which could hide a real failure inside the loader package.
+    from minimax_h3_keyless.loader import load_keyless_model
 
 
 class MiniMaxH3KeylessLoader:
