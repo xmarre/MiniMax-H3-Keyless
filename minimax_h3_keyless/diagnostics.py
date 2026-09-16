@@ -53,13 +53,20 @@ def regularized_ls_row_route(
     v_weight_math: torch.Tensor,
     *, lambda_relative: float,
 ) -> tuple[torch.Tensor, float]:
-    """Return the PyTorch storage-orientation V->route weight.
+    """Return the storage weight for the pre-q_norm query factorization.
 
-    B and C are mathematical [hidden, head_dim] teacher K/V projections. The returned
-    matrix W has [out,in] orientation for ``PerHeadLinear.weight`` and minimizes
-    ``||C @ W.T - B||``. For positive regularization this is
-    ``W = B.T C (C.T C + lambda I)^-1``. At lambda=0, ``lstsq`` supplies the
-    minimum-norm solution when C is rank deficient instead of requiring an inverse.
+    Let B/C be mathematical teacher K/V matrices [hidden, head_dim]. ``PerHeadLinear``
+    applies a stored matrix W as ``q @ W.T``. The design's mathematical query factor is
+    therefore ``R = W.T``. For the fixed-V raw least-squares initialization,
+
+        R = B.T C (C.T C + lambda I)^-1
+
+    so the storage tensor must be
+
+        W = (C.T C + lambda I)^-1 C.T B.
+
+    Equivalently W minimizes ``||C @ W - B||``. Returning the transpose here would
+    silently optimize the wrong bilinear map even though its shapes remain valid.
     """
     B = k_weight_math.double()
     C = v_weight_math.double()
@@ -71,11 +78,10 @@ def regularized_ls_row_route(
     scale = float(torch.diagonal(gram).mean().item())
     lam = float(lambda_relative) * scale
     if lam == 0.0:
-        mathematical_route = torch.linalg.lstsq(C, B).solution
-        return mathematical_route.T, lam
+        storage_weight = torch.linalg.lstsq(C, B).solution
+        return storage_weight, lam
     eye = torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
-    rhs = B.T @ C
-    storage_weight = torch.linalg.solve((gram + lam * eye).T, rhs.T).T
+    storage_weight = torch.linalg.solve(gram + lam * eye, C.T @ B)
     return storage_weight, lam
 
 

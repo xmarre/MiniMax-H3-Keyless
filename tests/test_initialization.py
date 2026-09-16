@@ -43,18 +43,19 @@ def test_identity_initialization_copies_q_v_norms_and_out() -> None:
     assert report.lambda_actual is None
 
 
-def test_least_squares_initialization_recovers_exact_v_to_k_map() -> None:
+def test_least_squares_initialization_recovers_design_query_factor_storage() -> None:
     torch.manual_seed(32)
     hidden, heads, head_dim = 8, 2, 3
     inner = heads * head_dim
     q = torch.randn(inner, hidden)
     v = torch.randn(inner, hidden)
-    expected_route = torch.randn(heads, head_dim, head_dim)
+    expected_storage_route = torch.randn(heads, head_dim, head_dim)
     k_heads = []
     for h in range(heads):
         a, b = h * head_dim, (h + 1) * head_dim
         c_math = v[a:b].T
-        k_math = c_math @ expected_route[h].T
+        # B = C W means q @ W.T is exactly the design's raw query-side factor.
+        k_math = c_math @ expected_storage_route[h]
         k_heads.append(k_math.T)
     k = torch.cat(k_heads, dim=0)
     qkv = torch.cat((q, k, v), dim=0)
@@ -68,7 +69,9 @@ def test_least_squares_initialization_recovers_exact_v_to_k_map() -> None:
         route_mode="least_squares",
         lambda_relative=0.0,
     )
-    torch.testing.assert_close(student.query_route.weight, expected_route, atol=1e-5, rtol=1e-5)
+    torch.testing.assert_close(
+        student.query_route.weight, expected_storage_route, atol=1e-5, rtol=1e-5
+    )
     assert report.lambda_actual == (0.0, 0.0)
 
 
