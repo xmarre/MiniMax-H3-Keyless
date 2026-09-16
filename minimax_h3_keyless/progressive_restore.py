@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -22,6 +22,15 @@ from .progressive_artifacts import (
 
 
 StudentBuilder = Callable[[nn.Module, int], nn.Module]
+
+
+@dataclass(frozen=True)
+class _LoadedProgressiveResult:
+    identity: ProgressiveRunIdentity
+    result_payload_sha256: str
+    checkpoint_filename: str
+    checkpoint_sha256: str
+    step: int
 
 
 def _default_student_builder(native_block: nn.Module, block_index: int) -> nn.Module:
@@ -61,7 +70,8 @@ def _load_result(
     expected_sha256: str,
     accepted: ProgressiveAcceptedBlock,
     prefix_before: ProgressivePrefix,
-) -> tuple[ProgressiveRunIdentity, str]:
+    expected_checkpoint_filename: str,
+) -> _LoadedProgressiveResult:
     actual_sha = sha256_file(path)
     if actual_sha.lower() != accepted.result_sha256.lower() or actual_sha.lower() != expected_sha256.lower():
         raise RuntimeError("accepted progressive result SHA-256 does not match immutable prefix")
@@ -110,6 +120,20 @@ def _load_result(
         )
     if value.get("stage") != accepted.final_stage:
         raise RuntimeError("accepted progressive result stage differs from prefix record")
+    step = value.get("step")
+    if isinstance(step, bool) or not isinstance(step, int) or step < 0:
+        raise RuntimeError("accepted progressive result step must be a non-negative integer")
+    checkpoint_filename = value.get("checkpoint_filename")
+    if (
+        not isinstance(checkpoint_filename, str)
+        or Path(checkpoint_filename).name != checkpoint_filename
+        or checkpoint_filename != expected_checkpoint_filename
+    ):
+        raise RuntimeError("accepted progressive result references the wrong checkpoint filename")
+    checkpoint_sha = value.get("checkpoint_sha256")
+    if not isinstance(checkpoint_sha, str) or checkpoint_sha.lower() != accepted.checkpoint_sha256.lower():
+        raise RuntimeError("accepted progressive result checkpoint hash differs from prefix record")
+
     result_payload = value.get("result")
     if not isinstance(result_payload, dict):
         raise RuntimeError("accepted progressive result is missing numerical payload")
@@ -118,10 +142,31 @@ def _load_result(
         raise RuntimeError("accepted progressive result payload hash does not recompute")
     if result_payload.get("block_index") != accepted.block_index:
         raise RuntimeError("accepted progressive numerical payload names the wrong block")
+    if result_payload.get("prefix_identity_sha256") != prefix_before.identity_sha256:
+        raise RuntimeError("accepted progressive numerical payload names the wrong prior prefix")
+    if result_payload.get("final_stage") != accepted.final_stage:
+        raise RuntimeError("accepted progressive numerical payload names the wrong final stage")
+    if result_payload.get("selected_route_mode") != identity.route_mode:
+        raise RuntimeError("accepted progressive numerical payload route mode differs from run identity")
+    try:
+        selected_lambda = float(result_payload.get("selected_lambda_relative"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("accepted progressive numerical payload has an invalid route lambda") from exc
+    if selected_lambda != float(identity.lambda_relative):
+        raise RuntimeError("accepted progressive numerical payload route lambda differs from run identity")
     gate = result_payload.get("gate")
     if not isinstance(gate, dict) or gate.get("passed") is not True:
         raise RuntimeError("accepted progressive result does not record a passed numerical gate")
-    return identity, payload_sha
+    if gate.get("block_index") != accepted.block_index:
+        raise RuntimeError("accepted progressive gate names the wrong block")
+
+    return _LoadedProgressiveResult(
+        identity=identity,
+        result_payload_sha256=payload_sha,
+        checkpoint_filename=checkpoint_filename,
+        checkpoint_sha256=checkpoint_sha.lower(),
+        step=step,
+    )
 
 
 def _load_student_state(
@@ -131,6 +176,7 @@ def _load_student_state(
     accepted: ProgressiveAcceptedBlock,
     identity: ProgressiveRunIdentity,
     result_payload_sha256: str,
+    expected_step: int,
 ) -> dict[str, torch.Tensor]:
     actual_sha = sha256_file(path)
     if actual_sha.lower() != accepted.checkpoint_sha256.lower() or actual_sha.lower() != expected_sha256.lower():
@@ -160,6 +206,8 @@ def _load_student_state(
         raise RuntimeError("accepted progressive checkpoint identity differs from result identity")
     if value.get("stage") != accepted.final_stage:
         raise RuntimeError("accepted progressive checkpoint stage differs from prefix record")
+    if value.get("step") != expected_step:
+        raise RuntimeError("accepted progressive checkpoint step differs from result evidence")
     if str(value.get("result_payload_sha256", "")).lower() != result_payload_sha256.lower():
         raise RuntimeError("accepted progressive checkpoint is not bound to its result payload")
     state = value.get("student_state_dict")
@@ -197,23 +245,20 @@ def restore_progressive_model_prefix(
         if accepted.block_index != offset:
             raise RuntimeError("accepted progressive prefix is not contiguous early-to-late")
         checkpoint_path, result_path = _artifact_paths(output_dir, prefix, accepted)
-        identity, payload_sha = _load_result(
+        loaded_result = _load_result(
             result_path,
             expected_sha256=accepted.result_sha256,
             accepted=accepted,
             prefix_before=prior,
+            expected_checkpoint_filename=checkpoint_path.name,
         )
-        if Path(str(json.loads(result_path.read_text(encoding="utf-8"))["checkpoint_filename"])).name != checkpoint_path.name:
-            raise RuntimeError("accepted progressive result references the wrong checkpoint filename")
-        result_json = json.loads(result_path.read_text(encoding="utf-8"))
-        if str(result_json["checkpoint_sha256"]).lower() != accepted.checkpoint_sha256.lower():
-            raise RuntimeError("accepted progressive result checkpoint hash differs from prefix record")
         state = _load_student_state(
             checkpoint_path,
             expected_sha256=accepted.checkpoint_sha256,
             accepted=accepted,
-            identity=identity,
-            result_payload_sha256=payload_sha,
+            identity=loaded_result.identity,
+            result_payload_sha256=loaded_result.result_payload_sha256,
+            expected_step=loaded_result.step,
         )
 
         native_block = blocks[offset]
