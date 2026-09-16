@@ -128,11 +128,20 @@ def build_training_student_block(
     route_mode: RouteInitMode = "identity",
     lambda_relative: float = 0.0,
 ) -> tuple[nn.Module, RouteInitializationReport]:
-    """Deep-copy one native H3 block and replace only its attention with Keyless training form.
+    """Deep-copy one native H3 block and install an identity-route training student.
 
     All copied MLP/AdaLN/norm/non-attention parameters are frozen. This function expects
-    the canonical BF16 teacher block, not an INT8/quantized teacher.
+    the canonical BF16 teacher block, not an INT8/quantized teacher. Least-squares route
+    initialization is intentionally not constructed here: it depends on immutable
+    captured post-AdaLN train activations and is installed by the Stage-A runner after
+    the structural student exists. Calling this helper directly with ``least_squares``
+    fails closed rather than falling back to a projection-weight approximation.
     """
+    if route_mode != "identity" or lambda_relative != 0.0:
+        raise ValueError(
+            "build_training_student_block only constructs the identity-route structural student; "
+            "Stage-A least-squares initialization must come from captured train activations"
+        )
     if not hasattr(native_block, "attn"):
         raise RuntimeError("native H3 block has no attention module")
     native_attention = native_block.attn
@@ -166,8 +175,8 @@ def build_training_student_block(
             if not gate
             else native_attention.to_gate_compress.weight.detach()
         ),
-        route_mode=route_mode,
-        lambda_relative=lambda_relative,
+        route_mode="identity",
+        lambda_relative=0.0,
     )
     student_block.attn = student_attention
     set_pilot_block_stage(student_block, "route")
