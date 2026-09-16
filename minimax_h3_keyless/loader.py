@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import string
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -62,8 +63,22 @@ def _derive_h3_unet_config(sd: Mapping[str, torch.Tensor], metadata: Mapping[str
     return _merge_metadata_config(cfg, metadata)
 
 
+def _require_manifest_identity(metadata: Mapping[str, str]) -> str:
+    value = metadata.get("manifest_sha256")
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or any(ch not in string.hexdigits for ch in value)
+    ):
+        raise RuntimeError(
+            "canonical Keyless artifact is missing a valid 64-hex manifest_sha256 identity"
+        )
+    return value.lower()
+
+
 def _validate_loaded_checkpoint(sd: Mapping[str, Any], metadata: Mapping[str, str]) -> str:
     """Select the strict validator from storage/metadata and fail closed on mixtures."""
+    _require_manifest_identity(metadata)
     has_native_quant_storage = any(key.endswith(".comfy_quant") for key in sd)
     has_quant_metadata = any(
         key in metadata
