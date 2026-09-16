@@ -158,6 +158,39 @@ def test_capture_bundle_rejects_noncanonical_replay_options_and_non_json_context
     assert not path.exists()
 
 
+def test_capture_publish_never_overwrites_existing_bundle_or_receipt(tmp_path: Path) -> None:
+    path = tmp_path / "capture.pt"
+    first = write_captured_pilot_bundle(path, _records(), provenance=_provenance())
+    receipt_path = Path(first.receipt_path)
+    original_bundle = path.read_bytes()
+    original_receipt = receipt_path.read_bytes()
+
+    changed = tuple(
+        replace(record, attention_input=record.attention_input + 100.0)
+        for record in _records()
+    )
+    with pytest.raises(FileExistsError, match="immutable"):
+        write_captured_pilot_bundle(path, changed, provenance=_provenance())
+
+    assert path.read_bytes() == original_bundle
+    assert receipt_path.read_bytes() == original_receipt
+    assert sha256_file(path) == first.bundle_sha256
+    assert sha256_file(receipt_path) == first.receipt_sha256
+
+
+def test_preexisting_receipt_is_preserved_and_new_bundle_link_is_rolled_back(tmp_path: Path) -> None:
+    path = tmp_path / "capture.pt"
+    receipt_path = path.with_suffix(path.suffix + ".receipt.json")
+    sentinel = b"preexisting immutable receipt\n"
+    receipt_path.write_bytes(sentinel)
+
+    with pytest.raises(FileExistsError, match="immutable"):
+        write_captured_pilot_bundle(path, _records(), provenance=_provenance())
+
+    assert not path.exists()
+    assert receipt_path.read_bytes() == sentinel
+
+
 def test_capture_provenance_cannot_claim_a_different_teacher() -> None:
     with pytest.raises(ValueError, match="teacher SHA-256"):
         _provenance(teacher_model_sha256="0" * 64)
