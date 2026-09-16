@@ -31,6 +31,7 @@ from .pilot_gates import (
 )
 from .pilot_replay import CapturedReplayReport
 from .pilot_runner import StageAInitializationEvaluation, select_stage_a_initialization
+from .route_fit import RouteActivationFitDiagnostics
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,91 @@ def _finite(name: str, value: Any) -> float:
     if not math.isfinite(out):
         raise RuntimeError(f"{name} must be finite")
     return out
+
+
+def _route_fit_diagnostics(
+    value: Any,
+    *,
+    route_mode: str,
+    lambda_relative: float,
+) -> RouteActivationFitDiagnostics | None:
+    if route_mode == "identity":
+        if value is not None:
+            raise RuntimeError("Stage-A identity initialization must not carry route-fit diagnostics")
+        return None
+    row = _object(value, "Stage-A route-fit diagnostics")
+    keys = {
+        "rows",
+        "lambda_relative",
+        "lambda_actual",
+        "smallest_singular_value",
+        "largest_singular_value",
+        "numerical_rank",
+        "full_rank_condition_number",
+    }
+    _exact_keys(row, keys, "Stage-A route-fit diagnostics")
+    rows = row["rows"]
+    if isinstance(rows, bool) or not isinstance(rows, int) or rows <= 0:
+        raise RuntimeError("Stage-A route-fit rows must be a positive integer")
+    stored_relative = _finite("Stage-A route-fit lambda_relative", row["lambda_relative"])
+    if stored_relative < 0 or not math.isclose(stored_relative, lambda_relative, rel_tol=0.0, abs_tol=1e-15):
+        raise RuntimeError("Stage-A route-fit lambda_relative does not match its initialization row")
+
+    names = (
+        "lambda_actual",
+        "smallest_singular_value",
+        "largest_singular_value",
+        "numerical_rank",
+        "full_rank_condition_number",
+    )
+    arrays = {name: row[name] for name in names}
+    if any(not isinstance(arrays[name], list) for name in names):
+        raise RuntimeError("Stage-A route-fit per-head diagnostics must be JSON arrays")
+    lengths = {len(arrays[name]) for name in names}
+    if len(lengths) != 1 or not lengths or next(iter(lengths)) <= 0:
+        raise RuntimeError("Stage-A route-fit per-head diagnostics have inconsistent lengths")
+
+    lambda_actual = tuple(
+        _finite("Stage-A route-fit lambda_actual", value) for value in arrays["lambda_actual"]
+    )
+    smallest = tuple(
+        _finite("Stage-A route-fit smallest singular value", value)
+        for value in arrays["smallest_singular_value"]
+    )
+    largest = tuple(
+        _finite("Stage-A route-fit largest singular value", value)
+        for value in arrays["largest_singular_value"]
+    )
+    ranks: list[int] = []
+    for value in arrays["numerical_rank"]:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise RuntimeError("Stage-A route-fit numerical ranks must be non-negative integers")
+        ranks.append(value)
+    conditions: list[float | None] = []
+    for value in arrays["full_rank_condition_number"]:
+        if value is None:
+            conditions.append(None)
+            continue
+        condition = _finite("Stage-A route-fit condition number", value)
+        if condition < 1.0:
+            raise RuntimeError("Stage-A route-fit condition numbers must be at least one")
+        conditions.append(condition)
+    if any(value < 0.0 for value in lambda_actual):
+        raise RuntimeError("Stage-A route-fit lambda_actual values must be non-negative")
+    if any(value < 0.0 for value in (*smallest, *largest)):
+        raise RuntimeError("Stage-A route-fit singular values must be non-negative")
+    if any(lo > hi for lo, hi in zip(smallest, largest)):
+        raise RuntimeError("Stage-A route-fit singular-value bounds are inconsistent")
+
+    return RouteActivationFitDiagnostics(
+        rows=rows,
+        lambda_relative=stored_relative,
+        lambda_actual=lambda_actual,
+        smallest_singular_value=smallest,
+        largest_singular_value=largest,
+        numerical_rank=tuple(ranks),
+        full_rank_condition_number=tuple(conditions),
+    )
 
 
 def _case_metrics(row: Any) -> PilotCaseMetrics:
@@ -197,13 +283,27 @@ def _training_event(row: Any) -> PilotTrainingEvent:
 
 def _initialization(row: Any) -> StageAInitializationEvaluation:
     row = _object(row, "Stage-A initialization evaluation")
-    _exact_keys(row, {"route_mode", "lambda_relative", "metrics"}, "Stage-A initialization evaluation")
+    _exact_keys(
+        row,
+        {"route_mode", "lambda_relative", "metrics", "route_fit_diagnostics"},
+        "Stage-A initialization evaluation",
+    )
     if row["route_mode"] not in ("identity", "least_squares"):
         raise RuntimeError(f"invalid Stage-A route mode: {row['route_mode']!r}")
     lam = _finite("Stage-A initialization lambda_relative", row["lambda_relative"])
     if lam < 0:
         raise RuntimeError("Stage-A initialization lambda_relative must be non-negative")
-    return StageAInitializationEvaluation(row["route_mode"], lam, _aggregate(row["metrics"]))
+    diagnostics = _route_fit_diagnostics(
+        row["route_fit_diagnostics"],
+        route_mode=row["route_mode"],
+        lambda_relative=lam,
+    )
+    return StageAInitializationEvaluation(
+        row["route_mode"],
+        lam,
+        _aggregate(row["metrics"]),
+        diagnostics,
+    )
 
 
 def _replay(row: Any, block_index: int) -> CapturedReplayReport:
@@ -330,8 +430,6 @@ def load_completed_stage_a_block_evidence(
     if identity.gate_manifest_sha256.lower() != expected_gate:
         raise RuntimeError("completed Stage-A gate identity does not match this campaign")
 
-    # Trusted-local checkpoint: this verifies the JSON numerical evidence is the exact
-    # payload whose hash was embedded before the checkpoint's own full-file hash existed.
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     try:
         if not isinstance(checkpoint, dict) or checkpoint.get("schema") != RESUME_SCHEMA:
