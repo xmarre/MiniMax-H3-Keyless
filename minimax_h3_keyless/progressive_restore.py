@@ -8,12 +8,12 @@ from typing import Callable
 import torch
 import torch.nn as nn
 
-from .attention import KeylessAttentionTrain
+from .attention import KeylessAttentionDeploy, KeylessAttentionTrain
 from .checkpoint import sha256_file
-from .pilot import build_training_student_block, set_pilot_block_stage
+from .export import fold_query_route_weight
+from .pilot import _native_attention_facts
 from .pilot_campaign import canonical_json_sha256
 from .progressive import ProgressiveAcceptedBlock, ProgressivePrefix, validate_progressive_model_prefix
-from .progressive_acceptance import fold_progressive_training_block
 from .progressive_artifacts import (
     PROGRESSIVE_RESULT_SCHEMA,
     PROGRESSIVE_RESUME_SCHEMA,
@@ -33,14 +33,45 @@ class _LoadedProgressiveResult:
     step: int
 
 
-def _default_student_builder(native_block: nn.Module, block_index: int) -> nn.Module:
-    student, _ = build_training_student_block(
-        native_block,
-        block_index=block_index,
-        route_mode="identity",
-        lambda_relative=0.0,
+def _build_training_attention_from_native(
+    native_block: nn.Module,
+    block_index: int,
+) -> KeylessAttentionTrain:
+    native_attention = getattr(native_block, "attn", None)
+    if native_attention is None:
+        raise RuntimeError("progressive restore native block has no attention module")
+    hidden, heads, head_dim, eps, gate = _native_attention_facts(native_attention)
+    qkv_weight = native_attention.qkv_proj.weight
+    if qkv_weight.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"progressive restore requires the pinned BF16 native teacher, got {qkv_weight.dtype}"
+        )
+    return KeylessAttentionTrain(
+        hidden,
+        heads,
+        head_dim,
+        eps,
+        gate_compress=gate,
+        block_index=int(block_index),
+        dtype=qkv_weight.dtype,
+        device=qkv_weight.device,
+        operations=None,
     )
-    return student
+
+
+def _default_student_builder(native_block: nn.Module, block_index: int) -> nn.Module:
+    """Build only the training attention needed to reconstruct one accepted block.
+
+    Progressive checkpoints retain the full copied block state for resume/audit purposes,
+    but accepted restore only needs the attention state. Keeping the native block in place
+    avoids duplicating its large frozen MLP/AdaLN tensors while reconstructing a prefix.
+    """
+    shell = nn.Module()
+    shell.add_module(
+        "attn",
+        _build_training_attention_from_native(native_block, block_index),
+    )
+    return shell
 
 
 def _prefix_before(prefix: ProgressivePrefix, count: int) -> ProgressivePrefix:
@@ -218,6 +249,83 @@ def _load_student_state(
     return state
 
 
+def _attention_state_from_full_checkpoint(
+    state: dict[str, torch.Tensor],
+    *,
+    native_block: nn.Module,
+    training_attention: KeylessAttentionTrain,
+) -> dict[str, torch.Tensor]:
+    """Validate the full resume key topology and return only accepted attention tensors.
+
+    Non-attention tensors are retained in resume artifacts for audit/resume, but they are
+    frozen by design and are never installed during accepted-prefix reconstruction. The
+    live pinned teacher remains the source of truth for those tensors.
+    """
+    expected_attention = set(training_attention.state_dict())
+    expected_non_attention = {
+        name for name in native_block.state_dict()
+        if not name.startswith("attn.")
+    }
+    expected_full = {
+        *(f"attn.{name}" for name in expected_attention),
+        *expected_non_attention,
+    }
+    actual_full = set(state)
+    if actual_full != expected_full:
+        missing = sorted(expected_full - actual_full)
+        unexpected = sorted(actual_full - expected_full)
+        raise RuntimeError(
+            "accepted progressive checkpoint state keys do not match the canonical "
+            f"training block: missing={missing}, unexpected={unexpected}"
+        )
+    return {
+        name: state[f"attn.{name}"]
+        for name in sorted(expected_attention)
+    }
+
+
+def _fold_training_attention(training: KeylessAttentionTrain) -> KeylessAttentionDeploy:
+    """Fold one accepted q/R/v attention without copying the frozen H3 block."""
+    q_weight = getattr(training.q_proj, "weight", None)
+    v_weight = getattr(training.v_proj, "weight", None)
+    route_weight = getattr(training.query_route, "weight", None)
+    if not all(torch.is_tensor(value) for value in (q_weight, v_weight, route_weight)):
+        raise RuntimeError("progressive restore requires materialized q/R/v weights")
+    assert q_weight is not None and v_weight is not None and route_weight is not None
+    if any(getattr(value, "is_meta", False) for value in (q_weight, v_weight, route_weight)):
+        raise RuntimeError("progressive restore cannot fold meta-device q/R/v weights")
+
+    deploy = KeylessAttentionDeploy(
+        training.hidden,
+        training.heads,
+        training.head_dim,
+        float(training.q_norm.eps),
+        gate_compress=training.to_gate_compress is not None,
+        block_index=training.block_index,
+        dtype=q_weight.dtype,
+        device=q_weight.device,
+        operations=None,
+    )
+    q_eff = fold_query_route_weight(
+        q_weight.detach(),
+        route_weight.detach(),
+        output_dtype=q_weight.dtype,
+    )
+    with torch.no_grad():
+        deploy.qv_proj.weight.copy_(torch.cat((q_eff, v_weight.detach()), dim=0))
+        deploy.q_norm.weight.copy_(training.q_norm.weight.detach())
+        deploy.route_norm.weight.copy_(training.route_norm.weight.detach())
+        deploy.out_proj.weight.copy_(training.out_proj.weight.detach())
+        if training.to_gate_compress is not None:
+            if deploy.to_gate_compress is None:
+                raise RuntimeError("progressive restore fold lost gate-compress topology")
+            deploy.to_gate_compress.weight.copy_(training.to_gate_compress.weight.detach())
+    deploy.eval()
+    for parameter in deploy.parameters():
+        parameter.requires_grad_(False)
+    return deploy
+
+
 def restore_progressive_model_prefix(
     model: nn.Module,
     prefix: ProgressivePrefix,
@@ -230,9 +338,13 @@ def restore_progressive_model_prefix(
     The input model must begin as the native core50 teacher. Blocks are restored strictly
     early-to-late. Each accepted result/checkpoint pair is hash-checked against the prefix,
     its run identity must extend the exact prior prefix, its numerical gate must record a
-    pass, and the training-form q/R/v state is loaded strictly before being folded to the
-    deploy QV representation. A failure leaves already-restored earlier accepted blocks in
-    place and does not modify the failing or later native block.
+    pass, and the training-form q/R/v attention state is loaded strictly before being
+    folded to deploy QV form.
+
+    Only ``block.attn`` is replaced. Frozen MLP/AdaLN/non-attention tensors remain the
+    original pinned-teacher objects, avoiding a full H3 block deepcopy for every restored
+    prefix element. A failure leaves already-restored earlier attentions in place and does
+    not modify the failing or later native attention.
     """
 
     native_prefix = _prefix_before(prefix, 0)
@@ -263,15 +375,30 @@ def restore_progressive_model_prefix(
 
         native_block = blocks[offset]
         student = student_builder(native_block, offset)
-        if not isinstance(getattr(student, "attn", None), KeylessAttentionTrain):
-            raise RuntimeError("progressive restore student builder did not install KeylessAttentionTrain")
-        if int(getattr(student.attn, "block_index", -1)) != offset:
-            raise RuntimeError("progressive restore student builder installed the wrong block_index")
-        set_pilot_block_stage(student, accepted.final_stage)
-        student.load_state_dict(state, strict=True)
-        folded = fold_progressive_training_block(student)
-        blocks[offset] = folded
-        validate_progressive_model_prefix(model, _prefix_before(prefix, offset + 1))
+        training_attention = getattr(student, "attn", None)
+        if not isinstance(training_attention, KeylessAttentionTrain):
+            raise RuntimeError(
+                "progressive restore student builder did not install KeylessAttentionTrain"
+            )
+        if int(getattr(training_attention, "block_index", -1)) != offset:
+            raise RuntimeError(
+                "progressive restore student builder installed the wrong block_index"
+            )
+        attention_state = _attention_state_from_full_checkpoint(
+            state,
+            native_block=native_block,
+            training_attention=training_attention,
+        )
+        training_attention.load_state_dict(attention_state, strict=True)
+        folded_attention = _fold_training_attention(training_attention)
+
+        original_attention = native_block.attn
+        try:
+            native_block.attn = folded_attention
+            validate_progressive_model_prefix(model, _prefix_before(prefix, offset + 1))
+        except BaseException:
+            native_block.attn = original_attention
+            raise
 
     validate_progressive_model_prefix(model, prefix)
     return model
