@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
+from typing import Any, Mapping
 
 import torch
 from safetensors.torch import save_file
 
-from .checkpoint import validate_deploy_checkpoint, validate_training_checkpoint
+from .checkpoint import sha256_file, validate_deploy_checkpoint, validate_training_checkpoint
 from .contracts import (
     ARCHITECTURE,
     CHECKPOINT_FORMAT_VERSION,
@@ -21,6 +24,17 @@ from .contracts import (
     TEACHER_SHA256,
     TOKEN_REFINER_BLOCKS,
 )
+
+
+@dataclass(frozen=True)
+class ExportResult:
+    artifact_path: str
+    artifact_sha256: str
+    artifact_bytes: int
+    manifest_path: str
+    manifest_sha256: str
+    manifest_identity_sha256: str
+    tensor_count: int
 
 
 def fold_query_route_weight(
@@ -89,10 +103,116 @@ def canonical_metadata(
     return md
 
 
+def _canonical_json_bytes(value: Mapping[str, Any]) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+
+
+def _tensor_manifest(tensors: Mapping[str, torch.Tensor]) -> list[dict[str, Any]]:
+    rows = []
+    for key in sorted(tensors):
+        tensor = tensors[key]
+        rows.append(
+            {
+                "key": key,
+                "shape": [int(x) for x in tensor.shape],
+                "dtype": str(tensor.dtype),
+                "numel": int(tensor.numel()),
+                "bytes": int(tensor.numel() * tensor.element_size()),
+            }
+        )
+    return rows
+
+
+def build_export_manifest_body(
+    tensors: Mapping[str, torch.Tensor],
+    *,
+    artifact_filename: str,
+    metadata: Mapping[str, str],
+    command: str | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the deterministic pre-artifact manifest body hashed into checkpoint metadata."""
+    clean_metadata = {k: str(v) for k, v in metadata.items() if k != "manifest_sha256"}
+    rows = _tensor_manifest(tensors)
+    body: dict[str, Any] = {
+        "schema": "minimax_h3_keyless_export_manifest_v1",
+        "artifact_filename": artifact_filename,
+        "metadata": dict(sorted(clean_metadata.items())),
+        "tensor_count": len(rows),
+        "tensor_payload_bytes": sum(row["bytes"] for row in rows),
+        "tensors": rows,
+    }
+    if command is not None:
+        body["command"] = command
+    if extra:
+        body["extra"] = dict(extra)
+    return body
+
+
+def manifest_identity_sha256(body: Mapping[str, Any]) -> str:
+    return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
+
+
 def export_folded_bf16(
-    state_dict: Mapping[str, torch.Tensor], output_path: str | Path, *, metadata: Mapping[str, str]
-) -> None:
+    state_dict: Mapping[str, torch.Tensor],
+    output_path: str | Path,
+    *,
+    metadata: Mapping[str, str],
+    manifest_path: str | Path | None = None,
+    command: str | None = None,
+    manifest_extra: Mapping[str, Any] | None = None,
+) -> ExportResult:
+    """Write folded BF16 plus a deterministic provenance/tensor receipt.
+
+    The sidecar has two layers to avoid a hash cycle: the deterministic manifest body
+    is hashed first and that identity is embedded as ``manifest_sha256`` in the
+    safetensors metadata. After the artifact is written, the sidecar receipt adds the
+    artifact full-file SHA-256 and byte size. The final sidecar file hash is returned
+    separately and is not embedded back into the artifact.
+    """
+    output_path = Path(output_path)
     folded = fold_training_state_dict(state_dict, output_dtype=torch.bfloat16)
-    validate_deploy_checkpoint(folded, metadata)
+    base_metadata = {k: str(v) for k, v in metadata.items() if k != "manifest_sha256"}
+    body = build_export_manifest_body(
+        folded,
+        artifact_filename=output_path.name,
+        metadata=base_metadata,
+        command=command,
+        extra=manifest_extra,
+    )
+    identity = manifest_identity_sha256(body)
+    supplied_identity = metadata.get("manifest_sha256")
+    if supplied_identity is not None and supplied_identity.lower() != identity:
+        raise ValueError(
+            "supplied manifest_sha256 does not match the deterministic export manifest body"
+        )
+    final_metadata = dict(base_metadata)
+    final_metadata["manifest_sha256"] = identity
+    validate_deploy_checkpoint(folded, final_metadata)
+
     cpu = {k: v.detach().cpu().contiguous() for k, v in folded.items()}
-    save_file(cpu, str(output_path), metadata=dict(metadata))
+    save_file(cpu, str(output_path), metadata=final_metadata)
+    artifact_sha = sha256_file(output_path)
+    artifact_bytes = output_path.stat().st_size
+
+    receipt = dict(body)
+    receipt["manifest_sha256"] = identity
+    receipt["artifact_sha256"] = artifact_sha
+    receipt["artifact_bytes"] = artifact_bytes
+    if manifest_path is None:
+        manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
+    manifest_path = Path(manifest_path)
+    manifest_path.write_text(
+        json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    sidecar_sha = sha256_file(manifest_path)
+    return ExportResult(
+        artifact_path=str(output_path),
+        artifact_sha256=artifact_sha,
+        artifact_bytes=artifact_bytes,
+        manifest_path=str(manifest_path),
+        manifest_sha256=sidecar_sha,
+        manifest_identity_sha256=identity,
+        tensor_count=len(folded),
+    )
