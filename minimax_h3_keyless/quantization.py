@@ -23,10 +23,10 @@ from .contracts import (
     INNER_DIM,
     QUANTIZATION_RECIPE,
     TARGET_MODEL_REVISION,
+    TEACHER_COMPATIBILITY_MARKER,
     TEACHER_SHA256,
 )
 from .export import build_export_manifest_body, manifest_identity_sha256
-from .teacher_compat import TEACHER_COMPATIBILITY_MARKER
 
 
 QUANTIZATION_FORMAT = "int8_tensorwise"
@@ -41,6 +41,8 @@ class Int8ExportResult:
     artifact_sha256: str
     artifact_bytes: int
     source_bf16_sha256: str
+    source_bf16_receipt_path: str
+    source_bf16_receipt_sha256: str
     manifest_path: str
     manifest_sha256: str
     manifest_identity_sha256: str
@@ -171,6 +173,59 @@ def _require_accepted_bf16_metadata(metadata: Mapping[str, str]) -> str:
     return str(manifest_identity).lower()
 
 
+def _verify_source_bf16_receipt(
+    source_path: str | Path,
+    *,
+    source_sha256: str,
+    source_metadata: Mapping[str, str],
+    manifest_identity: str,
+    source_manifest_path: str | Path | None = None,
+) -> tuple[Path, str]:
+    """Verify the BF16 export receipt before accepting it as the INT8 parent artifact."""
+    source_path = Path(source_path)
+    receipt_path = (
+        Path(source_manifest_path)
+        if source_manifest_path is not None
+        else source_path.with_suffix(source_path.suffix + ".manifest.json")
+    )
+    if not receipt_path.is_file():
+        raise RuntimeError(
+            f"accepted BF16 source receipt is missing: {receipt_path}; "
+            "pass source_manifest_path if the sidecar was stored elsewhere"
+        )
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"invalid BF16 source receipt: {receipt_path}") from exc
+    if not isinstance(receipt, dict):
+        raise RuntimeError("BF16 source receipt must decode to a JSON object")
+    if receipt.get("schema") != "minimax_h3_keyless_export_manifest_v1":
+        raise RuntimeError("BF16 source receipt has the wrong manifest schema")
+    if receipt.get("artifact_filename") != source_path.name:
+        raise RuntimeError("BF16 source receipt artifact_filename does not match the source artifact")
+    if str(receipt.get("artifact_sha256", "")).lower() != source_sha256.lower():
+        raise RuntimeError("BF16 source receipt artifact_sha256 does not match the source artifact")
+    if receipt.get("artifact_bytes") != source_path.stat().st_size:
+        raise RuntimeError("BF16 source receipt artifact_bytes does not match the source artifact")
+    if str(receipt.get("manifest_sha256", "")).lower() != manifest_identity.lower():
+        raise RuntimeError("BF16 source receipt manifest identity does not match checkpoint metadata")
+
+    body = dict(receipt)
+    for receipt_only_key in ("manifest_sha256", "artifact_sha256", "artifact_bytes"):
+        body.pop(receipt_only_key, None)
+    recomputed = manifest_identity_sha256(body)
+    if recomputed.lower() != manifest_identity.lower():
+        raise RuntimeError("BF16 source receipt body does not reproduce its manifest identity")
+
+    expected_metadata = {
+        key: str(value) for key, value in source_metadata.items() if key != "manifest_sha256"
+    }
+    body_metadata = body.get("metadata")
+    if not isinstance(body_metadata, dict) or body_metadata != dict(sorted(expected_metadata.items())):
+        raise RuntimeError("BF16 source receipt metadata does not match checkpoint metadata")
+    return receipt_path, sha256_file(receipt_path)
+
+
 def _source_preflight(
     signatures: Mapping[str, TensorSignature], metadata: Mapping[str, str]
 ) -> tuple[str, ...]:
@@ -276,6 +331,7 @@ def export_int8_convrot_from_bf16(
     export_commit: str,
     quantize_device: str | torch.device = "cuda",
     manifest_path: str | Path | None = None,
+    source_manifest_path: str | Path | None = None,
     command: str | None = None,
     manifest_extra: Mapping[str, Any] | None = None,
     quantize_fn: Callable[[torch.Tensor], tuple[torch.Tensor, torch.Tensor, torch.Tensor]] | None = None,
@@ -293,6 +349,13 @@ def export_int8_convrot_from_bf16(
     source_manifest_identity = _require_accepted_bf16_metadata(source_metadata)
     targets = set(_source_preflight(signatures, source_metadata))
     source_sha = sha256_file(source_path)
+    source_receipt_path, source_receipt_sha = _verify_source_bf16_receipt(
+        source_path,
+        source_sha256=source_sha,
+        source_metadata=source_metadata,
+        manifest_identity=source_manifest_identity,
+        source_manifest_path=source_manifest_path,
+    )
     device = torch.device(quantize_device)
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA quantization was requested but torch.cuda.is_available() is false")
@@ -325,6 +388,7 @@ def export_int8_convrot_from_bf16(
             "quantization_convrot_groupsize": str(CONVROT_GROUPSIZE),
             "quantization_source_bf16_sha256": source_sha,
             "quantization_source_bf16_manifest_sha256": source_manifest_identity,
+            "quantization_source_bf16_receipt_sha256": source_receipt_sha,
             "export_commit": str(export_commit),
         }
     )
@@ -333,7 +397,9 @@ def export_int8_convrot_from_bf16(
         {
             "source_bf16_path": source_path.name,
             "source_bf16_sha256": source_sha,
+            "source_bf16_manifest_path": source_receipt_path.name,
             "source_bf16_manifest_sha256": source_manifest_identity,
+            "source_bf16_receipt_sha256": source_receipt_sha,
             "quantization_recipe": QUANTIZATION_RECIPE,
             "quantization_device_type": device.type,
             "stochastic_rounding": 0,
@@ -380,6 +446,8 @@ def export_int8_convrot_from_bf16(
         artifact_sha256=artifact_sha,
         artifact_bytes=artifact_bytes,
         source_bf16_sha256=source_sha,
+        source_bf16_receipt_path=str(source_receipt_path),
+        source_bf16_receipt_sha256=source_receipt_sha,
         manifest_path=str(manifest_path),
         manifest_sha256=sha256_file(manifest_path),
         manifest_identity_sha256=identity,

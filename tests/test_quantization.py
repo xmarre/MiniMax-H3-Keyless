@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from minimax_h3_keyless.contracts import CORE_BLOCKS, HIDDEN_SIZE, INNER_DIM, QUANTIZATION_RECIPE
+import minimax_h3_keyless.quantization as quant_mod
+from minimax_h3_keyless.checkpoint import sha256_file
+from minimax_h3_keyless.contracts import (
+    CORE_BLOCKS,
+    HIDDEN_SIZE,
+    INNER_DIM,
+    QUANTIZATION_RECIPE,
+    TARGET_MODEL_REVISION,
+    TEACHER_COMPATIBILITY_MARKER,
+    TEACHER_SHA256,
+)
+from minimax_h3_keyless.export import manifest_identity_sha256
 from minimax_h3_keyless.quantization import (
     CONVROT_GROUPSIZE,
     QUANTIZATION_FORMAT,
@@ -97,3 +109,74 @@ def test_quantize_weight_forwards_exact_live_layout_options() -> None:
     assert qdata.dtype == torch.int8 and qdata.shape == weight.shape
     assert scale.dtype == torch.float32 and scale.shape == (3, 1)
     assert descriptor.dtype == torch.uint8
+
+
+def _accepted_bf16_metadata(manifest_identity: str = "a" * 64) -> dict[str, str]:
+    return {
+        "teacher_compatibility": TEACHER_COMPATIBILITY_MARKER,
+        "parent_model_sha256": TEACHER_SHA256,
+        "parent_model_revision": TARGET_MODEL_REVISION,
+        "manifest_sha256": manifest_identity,
+    }
+
+
+def test_int8_source_requires_pinned_teacher_compatibility_metadata() -> None:
+    metadata = _accepted_bf16_metadata("b" * 64)
+    assert quant_mod._require_accepted_bf16_metadata(metadata) == "b" * 64
+
+    bad = dict(metadata)
+    bad.pop("teacher_compatibility")
+    with pytest.raises(RuntimeError, match="pinned-teacher-compatible"):
+        quant_mod._require_accepted_bf16_metadata(bad)
+
+    bad = dict(metadata)
+    bad["parent_model_sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="parent_model_sha256"):
+        quant_mod._require_accepted_bf16_metadata(bad)
+
+    bad = dict(metadata)
+    bad["quantization_format"] = QUANTIZATION_FORMAT
+    with pytest.raises(RuntimeError, match="already declares a quantized artifact"):
+        quant_mod._require_accepted_bf16_metadata(bad)
+
+
+def test_bf16_source_receipt_rebinds_manifest_metadata_and_artifact(tmp_path: Path) -> None:
+    artifact = tmp_path / "student.safetensors"
+    artifact.write_bytes(b"bounded-test-artifact")
+    metadata = _accepted_bf16_metadata()
+    body = {
+        "schema": "minimax_h3_keyless_export_manifest_v1",
+        "artifact_filename": artifact.name,
+        "metadata": dict(sorted({k: v for k, v in metadata.items() if k != "manifest_sha256"}.items())),
+        "tensor_count": 0,
+        "tensor_payload_bytes": 0,
+        "tensors": [],
+    }
+    identity = manifest_identity_sha256(body)
+    metadata["manifest_sha256"] = identity
+    receipt = dict(body)
+    receipt["manifest_sha256"] = identity
+    receipt["artifact_sha256"] = sha256_file(artifact)
+    receipt["artifact_bytes"] = artifact.stat().st_size
+    receipt_path = artifact.with_suffix(artifact.suffix + ".manifest.json")
+    receipt_path.write_text(json.dumps(receipt, sort_keys=True), encoding="utf-8")
+
+    verified_path, receipt_sha = quant_mod._verify_source_bf16_receipt(
+        artifact,
+        source_sha256=sha256_file(artifact),
+        source_metadata=metadata,
+        manifest_identity=identity,
+    )
+    assert verified_path == receipt_path
+    assert receipt_sha == sha256_file(receipt_path)
+
+    tampered = dict(receipt)
+    tampered["tensor_count"] = 1
+    receipt_path.write_text(json.dumps(tampered, sort_keys=True), encoding="utf-8")
+    with pytest.raises(RuntimeError, match="does not reproduce"):
+        quant_mod._verify_source_bf16_receipt(
+            artifact,
+            source_sha256=sha256_file(artifact),
+            source_metadata=metadata,
+            manifest_identity=identity,
+        )
