@@ -6,6 +6,7 @@ from typing import Callable, Mapping, Sequence
 import torch
 import torch.nn as nn
 
+from .attention import KeylessAttentionTrain
 from .initialization import RouteInitMode
 from .pilot import PilotLossWeights, build_training_student_block, set_pilot_block_stage
 from .pilot_artifacts import (
@@ -127,8 +128,6 @@ def _default_builder(
     route_mode: RouteInitMode,
     lambda_relative: float,
 ) -> tuple[nn.Module, object]:
-    # Activation-derived LS is installed by this runner after the structural student
-    # is built. Never fall back to the old projection-weight LS approximation.
     if route_mode == "least_squares":
         route_mode = "identity"
         lambda_relative = 0.0
@@ -181,8 +180,6 @@ def _build_student(
         raise RuntimeError(
             f"missing activation-derived Stage-A route fit for lambda={lambda_relative:g}"
         )
-    # Builders are asked for the exact copied/identity structural student. The only LS
-    # source accepted by the runner is the train-capture fit installed immediately below.
     student, _ = student_builder(teacher_block, block_index, "identity", 0.0)
     _install_activation_route_fit(student, fit)
     return student
@@ -219,7 +216,6 @@ def _evaluate_attention_diagnostics(
 def select_stage_a_initialization(
     evaluations: Sequence[StageAInitializationEvaluation],
 ) -> StageAInitializationEvaluation:
-    """Select initialization by held-out attention error with deterministic tie breaks."""
     if not evaluations:
         raise ValueError("Stage-A initialization selection requires evaluations")
     identities = [row for row in evaluations if row.route_mode == "identity"]
@@ -347,18 +343,6 @@ def run_stage_a_block_pilot(
     optimizer_factory: OptimizerFactory = _default_optimizer,
     artifact_request: StageAArtifactRequest | None = None,
 ) -> StageABlockPilotResult:
-    """Run one bounded Stage-A depth pilot from immutable live captures.
-
-    Initialization is selected only from the fixed holdout corpus. LS route fitting uses
-    only captured post-AdaLN train activations. Bounded complete-key attention diagnostics
-    are recorded for every initialization and for the final held-out candidate, but remain
-    secondary evidence: initialization selection and the predeclared gate continue to use
-    the primary same-input attention/block output metrics. Training follows the predeclared
-    monotonic freeze schedule and creates a fresh optimizer after every transition. If
-    ``artifact_request`` is supplied, the final training-form block, optimizer/RNG state
-    and all numerical evidence are persisted under immutable names. A failed numerical
-    gate is still persisted as evidence; it is never relabeled as an accepted pilot.
-    """
     if block_index not in PILOT_BLOCKS:
         raise ValueError(f"Stage-A pilot block must be one of {PILOT_BLOCKS}")
     plan = validate_stage_a_train_plan(train_plan)
