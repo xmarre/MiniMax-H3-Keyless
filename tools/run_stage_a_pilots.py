@@ -13,7 +13,7 @@ from minimax_h3_keyless.pilot_campaign import (
     validate_pilot_gate_manifest,
     write_json_atomic,
 )
-from minimax_h3_keyless.pilot_capture_set import load_stage_a_capture_set
+from minimax_h3_keyless.pilot_capture_lazy import load_stage_a_capture_set_lazy
 from minimax_h3_keyless.pilot_completed import load_completed_stage_a_block_evidence
 from minimax_h3_keyless.pilot_gates import evaluate_stage_a_campaign_gate
 from minimax_h3_keyless.pilot_inputs import (
@@ -62,7 +62,10 @@ def main() -> int:
     registry = load_stage_a_capture_registry(args.capture_registry)
     plan = load_stage_a_run_plan(args.train_plan)
 
-    capture_set = load_stage_a_capture_set(
+    # Stage-A captures are potentially multi-GiB at native H3 sequence lengths. Index and
+    # hash-validate the whole corpus without retaining activation tensors, then materialize
+    # only the requested pilot depth inside each sequential block run.
+    capture_set = load_stage_a_capture_set_lazy(
         registry.artifacts,
         dataset,
         required_coverage_tags=CANONICAL_STAGE_A_COVERAGE_TAGS,
