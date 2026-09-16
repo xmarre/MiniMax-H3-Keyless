@@ -53,21 +53,30 @@ def regularized_ls_row_route(
     v_weight_math: torch.Tensor,
     *, lambda_relative: float,
 ) -> tuple[torch.Tensor, float]:
-    """Return mathematical row-route R = B^T C (C^T C + lambda I)^-1.
+    """Return the PyTorch storage-orientation V->route weight.
 
-    To initialize PerHeadLinear.weight, copy R.T because nn.Linear stores [out,in].
+    B and C are mathematical [hidden, head_dim] teacher K/V projections. The returned
+    matrix W has [out,in] orientation for ``PerHeadLinear.weight`` and minimizes
+    ``||C @ W.T - B||``. For positive regularization this is
+    ``W = B.T C (C.T C + lambda I)^-1``. At lambda=0, ``lstsq`` supplies the
+    minimum-norm solution when C is rank deficient instead of requiring an inverse.
     """
     B = k_weight_math.double()
     C = v_weight_math.double()
     if B.shape != C.shape:
         raise ValueError("B and C must have identical shapes")
+    if lambda_relative < 0:
+        raise ValueError("lambda_relative must be non-negative")
     gram = C.T @ C
     scale = float(torch.diagonal(gram).mean().item())
     lam = float(lambda_relative) * scale
+    if lam == 0.0:
+        mathematical_route = torch.linalg.lstsq(C, B).solution
+        return mathematical_route.T, lam
     eye = torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
     rhs = B.T @ C
-    R = torch.linalg.solve((gram + lam * eye).T, rhs.T).T
-    return R, lam
+    storage_weight = torch.linalg.solve((gram + lam * eye).T, rhs.T).T
+    return storage_weight, lam
 
 
 def split_qkv_storage_weight(
