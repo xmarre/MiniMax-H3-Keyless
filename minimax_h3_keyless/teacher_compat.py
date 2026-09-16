@@ -14,11 +14,9 @@ from .contracts import (
     HIDDEN_SIZE,
     INNER_DIM,
     TARGET_MODEL_REVISION,
+    TEACHER_COMPATIBILITY_MARKER,
     TEACHER_SHA256,
 )
-
-
-TEACHER_COMPATIBILITY_MARKER = "pinned_exact_copy_v1"
 
 
 class TeacherCompatibilityError(ValueError):

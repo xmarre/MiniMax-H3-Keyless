@@ -21,10 +21,10 @@ from .contracts import (
     QV_ORDER,
     ROPE_POLICY,
     TARGET_MODEL_REVISION,
+    TEACHER_COMPATIBILITY_MARKER,
     TEACHER_SHA256,
     TOKEN_REFINER_BLOCKS,
 )
-from .teacher_compat import TEACHER_COMPATIBILITY_MARKER
 
 
 @dataclass(frozen=True)
@@ -179,15 +179,19 @@ def export_folded_bf16(
     separately and is not embedded back into the artifact.
     """
     output_path = Path(output_path)
+    if "teacher_compatibility" in metadata:
+        raise ValueError(
+            "metadata may not set reserved teacher_compatibility evidence; pass teacher_path"
+        )
     folded = fold_training_state_dict(state_dict, output_dtype=torch.bfloat16)
     base_metadata = {k: str(v) for k, v in metadata.items() if k != "manifest_sha256"}
     validate_deploy_checkpoint(folded, base_metadata)
 
     body_extra = dict(manifest_extra or {})
+    if "teacher_compatibility" in body_extra:
+        raise ValueError("manifest_extra may not override reserved teacher_compatibility evidence")
     compatibility_checked = teacher_path is not None
     if teacher_path is not None:
-        if "teacher_compatibility" in body_extra:
-            raise ValueError("manifest_extra may not override reserved teacher_compatibility evidence")
         from .teacher_compat import validate_deploy_mapping_against_teacher
 
         report = validate_deploy_mapping_against_teacher(teacher_path, folded)

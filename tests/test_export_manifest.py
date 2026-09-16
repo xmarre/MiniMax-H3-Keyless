@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 from safetensors import safe_open
 
 import minimax_h3_keyless.export as export_mod
 from minimax_h3_keyless.checkpoint import sha256_file
+from minimax_h3_keyless.contracts import TEACHER_COMPATIBILITY_MARKER
 from minimax_h3_keyless.export import (
     build_export_manifest_body,
     export_folded_bf16,
@@ -53,6 +55,7 @@ def test_export_receipt_binds_metadata_manifest_and_artifact_sha(tmp_path: Path,
     with safe_open(str(path), framework="pt", device="cpu") as f:
         md = dict(f.metadata() or {})
     assert md["manifest_sha256"] == result.manifest_identity_sha256
+    assert "teacher_compatibility" not in md
     receipt = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
     assert receipt["artifact_sha256"] == result.artifact_sha256
     assert receipt["artifact_bytes"] == result.artifact_bytes
@@ -82,17 +85,41 @@ def test_export_records_teacher_compatibility_in_hashed_manifest(tmp_path: Path,
         "parent_model_sha256": "a" * 64,
         "parent_model_revision": export_mod.TARGET_MODEL_REVISION,
     }
+    path = tmp_path / "student.safetensors"
     result = export_folded_bf16(
         {},
-        tmp_path / "student.safetensors",
+        path,
         metadata=metadata,
         teacher_path=tmp_path / "teacher.safetensors",
     )
     assert result.teacher_compatibility_checked is True
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        written_metadata = dict(f.metadata() or {})
+    assert written_metadata["teacher_compatibility"] == TEACHER_COMPATIBILITY_MARKER
     receipt = json.loads(Path(result.manifest_path).read_text(encoding="utf-8"))
+    assert receipt["metadata"]["teacher_compatibility"] == TEACHER_COMPATIBILITY_MARKER
     evidence = receipt["extra"]["teacher_compatibility"]
     assert evidence["status"] == "passed"
     assert evidence["exact_copy_tensor_count"] == 8
+
+
+def test_export_rejects_user_supplied_teacher_compatibility_evidence(tmp_path: Path, monkeypatch) -> None:
+    folded = {"weight": torch.ones(2, 2, dtype=torch.bfloat16)}
+    monkeypatch.setattr(export_mod, "fold_training_state_dict", lambda state, output_dtype: folded)
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
+    with pytest.raises(ValueError, match="reserved teacher_compatibility"):
+        export_folded_bf16(
+            {},
+            tmp_path / "forged.safetensors",
+            metadata={"teacher_compatibility": TEACHER_COMPATIBILITY_MARKER},
+        )
+    with pytest.raises(ValueError, match="reserved teacher_compatibility"):
+        export_folded_bf16(
+            {},
+            tmp_path / "forged-extra.safetensors",
+            metadata={},
+            manifest_extra={"teacher_compatibility": {"status": "passed"}},
+        )
 
 
 def test_export_rejects_predeclared_wrong_manifest_identity(tmp_path: Path, monkeypatch) -> None:

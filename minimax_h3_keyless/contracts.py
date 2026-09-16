@@ -13,6 +13,7 @@ CHECKPOINT_FORMAT_VERSION = 1
 QV_ORDER = "q_effective;v"
 ROPE_POLICY = "h3_split_half_96_v1"
 QUANTIZATION_RECIPE = "minimax_h3_keyless_core50_200_v1"
+TEACHER_COMPATIBILITY_MARKER = "pinned_exact_copy_v1"
 
 TARGET_MODEL_REPO = "xmarre/MiniMax-H3-Pruned-Ref-Delta-Fused-r1024-ComfyUI"
 TARGET_MODEL_REVISION = "f26363f0d42fbd46ef59008fd5e4d946ea0e9426"
