@@ -22,6 +22,7 @@ from minimax_h3_keyless.pilot_runner import (
     select_stage_a_initialization,
     validate_stage_a_train_plan,
 )
+from minimax_h3_keyless.route_fit import RouteActivationFitDiagnostics
 
 
 class TinyNativeAttention(nn.Module):
@@ -187,6 +188,18 @@ def _metric(attn, block):
     )
 
 
+def _diagnostics(lambda_relative: float) -> RouteActivationFitDiagnostics:
+    return RouteActivationFitDiagnostics(
+        rows=10,
+        lambda_relative=lambda_relative,
+        lambda_actual=(lambda_relative, lambda_relative),
+        smallest_singular_value=(1.0, 1.5),
+        largest_singular_value=(2.0, 3.0),
+        numerical_rank=(2, 2),
+        full_rank_condition_number=(2.0, 2.0),
+    )
+
+
 def test_stage_plan_enforces_monotonic_escalation_and_value_before_norm_out() -> None:
     plan = validate_stage_a_train_plan(
         (
@@ -211,9 +224,13 @@ def test_stage_plan_enforces_monotonic_escalation_and_value_before_norm_out() ->
 def test_initialization_selection_prefers_holdout_attention_error_then_block_error() -> None:
     evaluations = (
         StageAInitializationEvaluation("identity", 0.0, _metric(0.3, 0.1)),
-        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2)),
-        StageAInitializationEvaluation("least_squares", 1e-4, _metric(0.2, 0.15)),
-        StageAInitializationEvaluation("least_squares", 1e-2, _metric(0.4, 0.01)),
+        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2), _diagnostics(0.0)),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, _metric(0.2, 0.15), _diagnostics(1e-4)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-2, _metric(0.4, 0.01), _diagnostics(1e-2)
+        ),
     )
     selected = select_stage_a_initialization(evaluations)
     assert selected.route_mode == "least_squares"
@@ -223,12 +240,33 @@ def test_initialization_selection_prefers_holdout_attention_error_then_block_err
 def test_initialization_selection_rejects_duplicate_ls_lambda() -> None:
     evaluations = (
         StageAInitializationEvaluation("identity", 0.0, _metric(0.3, 0.1)),
-        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2)),
-        StageAInitializationEvaluation("least_squares", 1e-4, _metric(0.2, 0.15)),
-        StageAInitializationEvaluation("least_squares", 1e-4, _metric(0.1, 0.1)),
-        StageAInitializationEvaluation("least_squares", 1e-2, _metric(0.4, 0.01)),
+        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2), _diagnostics(0.0)),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, _metric(0.2, 0.15), _diagnostics(1e-4)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, _metric(0.1, 0.1), _diagnostics(1e-4)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-2, _metric(0.4, 0.01), _diagnostics(1e-2)
+        ),
     )
     with pytest.raises(ValueError, match="LS lambdas"):
+        select_stage_a_initialization(evaluations)
+
+
+def test_initialization_selection_rejects_ls_without_activation_diagnostics() -> None:
+    evaluations = (
+        StageAInitializationEvaluation("identity", 0.0, _metric(0.3, 0.1)),
+        StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2)),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, _metric(0.2, 0.15), _diagnostics(1e-4)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-2, _metric(0.4, 0.01), _diagnostics(1e-2)
+        ),
+    )
+    with pytest.raises(ValueError, match="captured-activation diagnostics"):
         select_stage_a_initialization(evaluations)
 
 
@@ -251,11 +289,12 @@ def test_block_runner_replays_grid_trains_and_persists_immutable_evidence(tmp_pa
     assert len(result.replay_reports) == 4
     assert all(report.attention_input_max_abs_error == 0.0 for report in result.replay_reports)
     assert len(result.initialization_evaluations) == 4
-    assert {
-        row.lambda_relative
-        for row in result.initialization_evaluations
-        if row.route_mode == "least_squares"
-    } == {0.0, 1e-4, 1e-2}
+    ls_rows = [
+        row for row in result.initialization_evaluations if row.route_mode == "least_squares"
+    ]
+    assert {row.lambda_relative for row in ls_rows} == {0.0, 1e-4, 1e-2}
+    assert all(row.route_fit_diagnostics is not None for row in ls_rows)
+    assert all(row.route_fit_diagnostics.rows == 10 for row in ls_rows)
     assert len(result.training_events) == 2
     assert result.candidate.case_count == 2
     assert result.gate.block_index == 0
