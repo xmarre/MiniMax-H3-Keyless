@@ -238,6 +238,7 @@ def validate_int8_convrot_checkpoint(
     _metadata_sha256(metadata, "manifest_sha256")
     _metadata_sha256(metadata, "quantization_source_bf16_sha256")
     _metadata_sha256(metadata, "quantization_source_bf16_manifest_sha256")
+    _metadata_sha256(metadata, "quantization_source_bf16_receipt_sha256")
     if metadata.get("quantization_layer_recipe") != QUANTIZATION_RECIPE:
         raise CheckpointValidationError(
             f"quantization_layer_recipe must be {QUANTIZATION_RECIPE!r}"

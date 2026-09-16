@@ -87,6 +87,7 @@ def _int8_deploy() -> tuple[dict[str, TensorSignature], dict[str, str]]:
             "manifest_sha256": "d" * 64,
             "quantization_source_bf16_sha256": "a" * 64,
             "quantization_source_bf16_manifest_sha256": "b" * 64,
+            "quantization_source_bf16_receipt_sha256": "c" * 64,
             "quantization_format": "int8_tensorwise",
             "quantization_layer_recipe": QUANTIZATION_RECIPE,
             "quantization_layer_count": "200",
@@ -172,6 +173,17 @@ def test_int8_rejects_missing_bf16_manifest_identity() -> None:
         assert "quantization_source_bf16_manifest_sha256" in str(exc)
     else:
         raise AssertionError("INT8 artifact without source BF16 manifest identity must be rejected")
+
+
+def test_int8_rejects_missing_bf16_receipt_hash() -> None:
+    tensors, metadata = _int8_deploy()
+    metadata.pop("quantization_source_bf16_receipt_sha256")
+    try:
+        validate_int8_convrot_checkpoint(tensors, metadata)
+    except CheckpointValidationError as exc:
+        assert "quantization_source_bf16_receipt_sha256" in str(exc)
+    else:
+        raise AssertionError("INT8 artifact without source BF16 receipt hash must be rejected")
 
 
 def test_int8_rejects_wrong_per_output_row_scale_shape() -> None:
