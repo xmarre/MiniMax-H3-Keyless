@@ -29,7 +29,7 @@ from .pilot_runner import (
     select_stage_a_initialization,
     validate_stage_a_train_plan,
 )
-from .progressive import ProgressivePrefix
+from .progressive import PROGRESSIVE_PREFIX_CONTEXT_KEY, ProgressivePrefix
 from .progressive_capture_set import ProgressiveBlockCaptureSet
 from .progressive_gates import ProgressiveBlockGateResult, evaluate_progressive_block_gate
 from .route_fit import (
@@ -50,6 +50,8 @@ class ProgressiveBlockTrainingResult:
     Returning the candidate separately from ``ProgressivePrefix.advance`` is deliberate:
     a failed experiment cannot mutate the accepted model/prefix merely by completing a
     training call. Persistence and installation are a later explicit acceptance step.
+    ``optimizer`` is retained so the final training stage can be persisted with optimizer
+    and RNG state before the candidate is accepted.
     """
 
     block_index: int
@@ -66,6 +68,7 @@ class ProgressiveBlockTrainingResult:
     gate: ProgressiveBlockGateResult
     final_stage: str
     student_block: nn.Module
+    optimizer: torch.optim.Optimizer
 
 
 def _default_builder(
@@ -119,6 +122,47 @@ def _require_native_teacher_block(
         )
 
 
+def _validate_record_binding(
+    record,
+    *,
+    split: str,
+    prefix: ProgressivePrefix,
+    target: int,
+) -> None:
+    if record.block_index != target:
+        raise RuntimeError(
+            "progressive capture record targets the wrong block: "
+            f"expected={target}, actual={record.block_index}"
+        )
+    context = record.case.context
+    if not isinstance(context, Mapping):
+        raise RuntimeError("progressive capture record context must be a mapping")
+    bound = context.get(PROGRESSIVE_PREFIX_CONTEXT_KEY)
+    if not isinstance(bound, Mapping):
+        raise RuntimeError("progressive capture record is missing bound prefix context")
+    expected = {
+        "api": 1,
+        "prefix_identity_sha256": prefix.identity_sha256,
+        "accepted_blocks": list(prefix.accepted_blocks),
+        "next_block": target,
+        "stage_a_campaign_sha256": prefix.stage_a_campaign_sha256,
+        "dataset_manifest_sha256": prefix.dataset_manifest_sha256,
+        "gate_manifest_sha256": prefix.gate_manifest_sha256,
+    }
+    mismatches = [name for name, value in expected.items() if bound.get(name) != value]
+    if mismatches:
+        raise RuntimeError(
+            "progressive capture record prefix context differs from accepted prefix: "
+            + ", ".join(mismatches)
+        )
+    recorded_split = context.get("progressive_split")
+    if recorded_split != split:
+        raise RuntimeError(
+            "progressive capture record split annotation differs from capture set: "
+            f"expected={split!r}, actual={recorded_split!r}"
+        )
+
+
 def _validate_capture_context(
     captures: ProgressiveBlockCaptureSet,
     prefix: ProgressivePrefix,
@@ -150,6 +194,9 @@ def _validate_capture_context(
         raise RuntimeError("progressive capture set source revision differs from sweep revision")
     if not captures.train or not captures.holdout:
         raise RuntimeError("progressive target requires non-empty train and holdout captures")
+    for split, records in (("train", captures.train), ("holdout", captures.holdout)):
+        for record in records:
+            _validate_record_binding(record, split=split, prefix=prefix, target=target)
     return target
 
 
@@ -307,9 +354,11 @@ def run_progressive_block_training(
     """
 
     block_index = _validate_capture_context(captures, prefix)
-    validate_pilot_gate_manifest(gate_manifest)
-    if captures.gate_manifest_sha256.lower() != prefix.gate_manifest_sha256.lower():
-        raise RuntimeError("progressive gate manifest identity differs from capture policy")
+    gate_sha = validate_pilot_gate_manifest(gate_manifest)
+    if gate_sha.lower() != prefix.gate_manifest_sha256.lower():
+        raise RuntimeError("supplied progressive gate manifest differs from fixed sweep policy")
+    if captures.gate_manifest_sha256.lower() != gate_sha.lower():
+        raise RuntimeError("progressive capture set gate identity differs from supplied policy")
     policy: StageAGatePolicy = stage_a_policy_from_gate_manifest(gate_manifest)
     plan = validate_stage_a_train_plan(train_plan)
     _require_native_teacher_block(teacher_block, require_bf16=require_bf16_teacher)
@@ -366,6 +415,7 @@ def run_progressive_block_training(
     )
     student.to(device)
     events: list[PilotTrainingEvent] = []
+    optimizer: torch.optim.Optimizer | None = None
     for spec in plan:
         set_pilot_block_stage(student, spec.stage)
         parameters = [parameter for parameter in student.parameters() if parameter.requires_grad]
@@ -384,6 +434,7 @@ def run_progressive_block_training(
                 max_grad_norm=spec.max_grad_norm,
             )
         )
+    assert optimizer is not None
 
     candidate = evaluate_pilot_cases(
         teacher_block,
@@ -401,9 +452,6 @@ def run_progressive_block_training(
         training_events=event_tuple,
         policy=policy,
     )
-    student.eval()
-    for parameter in student.parameters():
-        parameter.requires_grad_(False)
 
     return ProgressiveBlockTrainingResult(
         block_index=block_index,
@@ -420,4 +468,5 @@ def run_progressive_block_training(
         gate=gate,
         final_stage=plan[-1].stage,
         student_block=student,
+        optimizer=optimizer,
     )
