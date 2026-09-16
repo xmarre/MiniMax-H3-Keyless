@@ -23,6 +23,7 @@ from .contracts import (
     QV_ORDER,
     ROPE_POLICY,
     TARGET_MODEL_REVISION,
+    TEACHER_COMPATIBILITY_MARKER,
     TEACHER_SHA256,
     TOKEN_REFINER_BLOCKS,
 )
@@ -101,6 +102,17 @@ def _metadata_int(metadata: Mapping[str, Any], key: str) -> int:
         raise CheckpointValidationError(f"missing/invalid metadata field {key!r}") from exc
 
 
+def _metadata_sha256(metadata: Mapping[str, Any], key: str) -> str:
+    value = metadata.get(key)
+    if not isinstance(value, str) or len(value) != 64:
+        raise CheckpointValidationError(f"missing/invalid SHA-256 metadata field {key!r}")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise CheckpointValidationError(f"missing/invalid SHA-256 metadata field {key!r}") from exc
+    return value.lower()
+
+
 def _validate_metadata(metadata: Mapping[str, Any]) -> None:
     if metadata.get("architecture") != ARCHITECTURE:
         raise CheckpointValidationError(
@@ -132,6 +144,14 @@ def _validate_metadata(metadata: Mapping[str, Any]) -> None:
         raise CheckpointValidationError("teacher_model_revision does not match the pinned H3 lineage")
     if metadata.get("teacher_model_sha256", "").lower() != TEACHER_SHA256:
         raise CheckpointValidationError("teacher_model_sha256 does not match the canonical BF16 teacher")
+    if metadata.get("parent_model_revision") != TARGET_MODEL_REVISION:
+        raise CheckpointValidationError("parent_model_revision does not match the pinned BF16 teacher")
+    if metadata.get("parent_model_sha256", "").lower() != TEACHER_SHA256:
+        raise CheckpointValidationError("parent_model_sha256 does not match the canonical BF16 teacher")
+    for key in ("training_run", "export_commit"):
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            raise CheckpointValidationError(f"missing/invalid metadata field {key!r}")
 
 
 def _validate_pruned_adaln(tensors: Mapping[str, Any]) -> None:
@@ -211,6 +231,13 @@ def validate_int8_convrot_checkpoint(
 ) -> ValidationReport:
     """Validate the exact native Comfy core50/200 INT8 ConvRot storage contract."""
     report = validate_deploy_checkpoint(tensors, metadata)
+    if metadata.get("teacher_compatibility") != TEACHER_COMPATIBILITY_MARKER:
+        raise CheckpointValidationError(
+            "INT8 ConvRot checkpoint is not derived from a pinned-teacher-compatible BF16 export"
+        )
+    _metadata_sha256(metadata, "manifest_sha256")
+    _metadata_sha256(metadata, "quantization_source_bf16_sha256")
+    _metadata_sha256(metadata, "quantization_source_bf16_manifest_sha256")
     if metadata.get("quantization_layer_recipe") != QUANTIZATION_RECIPE:
         raise CheckpointValidationError(
             f"quantization_layer_recipe must be {QUANTIZATION_RECIPE!r}"

@@ -17,6 +17,7 @@ from minimax_h3_keyless.contracts import (
     HIDDEN_SIZE,
     INNER_DIM,
     QUANTIZATION_RECIPE,
+    TEACHER_COMPATIBILITY_MARKER,
     TOKEN_REFINER_BLOCKS,
 )
 from minimax_h3_keyless.export import canonical_metadata
@@ -82,6 +83,10 @@ def _int8_deploy() -> tuple[dict[str, TensorSignature], dict[str, str]]:
     metadata = canonical_metadata(training_run="test", export_commit="deadbeef")
     metadata.update(
         {
+            "teacher_compatibility": TEACHER_COMPATIBILITY_MARKER,
+            "manifest_sha256": "d" * 64,
+            "quantization_source_bf16_sha256": "a" * 64,
+            "quantization_source_bf16_manifest_sha256": "b" * 64,
             "quantization_format": "int8_tensorwise",
             "quantization_layer_recipe": QUANTIZATION_RECIPE,
             "quantization_layer_count": "200",
@@ -139,12 +144,34 @@ def test_deploy_rejects_wrong_metadata_identity() -> None:
         raise AssertionError("wrong QV ordering metadata must be rejected")
 
 
+def test_deploy_rejects_wrong_parent_lineage() -> None:
+    metadata = canonical_metadata(training_run="test", export_commit="deadbeef")
+    metadata["parent_model_sha256"] = "0" * 64
+    try:
+        validate_deploy_checkpoint(_deploy(), metadata)
+    except CheckpointValidationError as exc:
+        assert "parent_model_sha256" in str(exc)
+    else:
+        raise AssertionError("wrong parent model lineage must be rejected")
+
+
 def test_valid_int8_core50_200_signature_is_accepted() -> None:
     tensors, metadata = _int8_deploy()
     report = validate_int8_convrot_checkpoint(tensors, metadata)
     assert report.core_blocks == 50
     assert len([k for k in tensors if k.endswith(".comfy_quant")]) == 200
     assert len([k for k in tensors if k.endswith(".weight_scale")]) == 200
+
+
+def test_int8_rejects_missing_bf16_manifest_identity() -> None:
+    tensors, metadata = _int8_deploy()
+    metadata.pop("quantization_source_bf16_manifest_sha256")
+    try:
+        validate_int8_convrot_checkpoint(tensors, metadata)
+    except CheckpointValidationError as exc:
+        assert "quantization_source_bf16_manifest_sha256" in str(exc)
+    else:
+        raise AssertionError("INT8 artifact without source BF16 manifest identity must be rejected")
 
 
 def test_int8_rejects_wrong_per_output_row_scale_shape() -> None:
