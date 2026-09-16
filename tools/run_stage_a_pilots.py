@@ -7,12 +7,12 @@ from pathlib import Path
 
 from minimax_h3_keyless.checkpoint import sha256_file
 from minimax_h3_keyless.contracts import TEACHER_SHA256
+from minimax_h3_keyless.immutable_io import write_json_no_replace
 from minimax_h3_keyless.live_capture import discover_clean_git_revision
 from minimax_h3_keyless.pilot_artifacts import StageAArtifactRequest
 from minimax_h3_keyless.pilot_campaign import (
     load_json_manifest,
     validate_pilot_gate_manifest,
-    write_json_atomic,
 )
 from minimax_h3_keyless.pilot_capture_lazy import load_stage_a_capture_set_lazy
 from minimax_h3_keyless.pilot_completed import load_completed_stage_a_block_evidence
@@ -207,7 +207,12 @@ def main() -> int:
         },
         "gate": asdict(campaign_gate),
     }
-    campaign_sha = write_json_atomic(campaign_result_path, payload)
+    try:
+        campaign_sha = write_json_no_replace(campaign_result_path, payload)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Stage-A campaign result is immutable; choose a new run_id: {campaign_result_path}"
+        ) from exc
     print(f"Stage-A campaign result: {campaign_result_path}")
     print(f"Stage-A campaign result SHA-256: {campaign_sha}")
     print(f"Stage-A campaign gate passed: {campaign_gate.passed}")
