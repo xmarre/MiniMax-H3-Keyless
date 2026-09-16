@@ -81,6 +81,17 @@ def _validate_loaded_checkpoint(sd: Mapping[str, Any], metadata: Mapping[str, st
     return "bf16"
 
 
+def _quant_dtype_policy(weight_dtype: torch.dtype | None, quant_config: Any) -> tuple[torch.dtype | None, bool]:
+    """Mirror ComfyUI's mixed-precision loader rule for quantized state dicts.
+
+    Native quantized storage is not an inference compute dtype. ComfyUI deliberately
+    removes the storage dtype from ``unet_dtype`` selection and asks manual-cast policy
+    to choose from the model's supported compute dtypes instead.
+    """
+    is_quantized = quant_config is not None
+    return (None if is_quantized else weight_dtype), is_quantized
+
+
 def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | None = None):
     """Load a canonical Keyless H3 artifact as an ordinary Comfy ModelPatcher."""
     model_options = dict(model_options or {})
@@ -105,21 +116,29 @@ def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | N
     weight_dtype = comfy.utils.weight_dtype(sd)
     load_device = model_options.get("load_device", comfy.model_management.get_torch_device())
     offload_device = model_options.get("offload_device", comfy.model_management.unet_offload_device())
-    unet_dtype = model_options.get("dtype") or comfy.model_management.unet_dtype(
-        model_params=parameters,
-        supported_dtypes=[torch.bfloat16, torch.float16, torch.float32],
-        weight_dtype=weight_dtype,
-        device=load_device,
-    )
-    manual_cast_dtype = comfy.model_management.unet_manual_cast(
-        unet_dtype, load_device, [torch.bfloat16, torch.float16, torch.float32]
-    )
 
     cfg_dict = _derive_h3_unet_config(sd, metadata)
     config = comfy.supported_models.MiniMaxH3(cfg_dict)
     quant_config = comfy.utils.detect_layer_quantization(sd, "")
     if quant_config is not None:
         config.quant_config = quant_config
+    effective_weight_dtype, is_quantized = _quant_dtype_policy(weight_dtype, quant_config)
+    supported_dtypes = list(config.supported_inference_dtypes)
+
+    unet_dtype = model_options.get("dtype", model_options.get("weight_dtype", None))
+    if unet_dtype is None:
+        unet_dtype = comfy.model_management.unet_dtype(
+            model_params=parameters,
+            supported_dtypes=supported_dtypes,
+            weight_dtype=effective_weight_dtype,
+            device=load_device,
+        )
+    manual_cast_dtype = comfy.model_management.unet_manual_cast(
+        None if is_quantized else unet_dtype,
+        load_device,
+        supported_dtypes,
+    )
+
     config.set_inference_dtype(unet_dtype, manual_cast_dtype, device=load_device)
     custom_operations = model_options.get("custom_operations")
     if custom_operations is not None:
