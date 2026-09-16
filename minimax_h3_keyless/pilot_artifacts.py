@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from .pilot_campaign import (
     PilotRunIdentity,
+    canonical_json_sha256,
     save_pilot_resume_checkpoint,
     write_json_atomic,
 )
@@ -72,8 +73,9 @@ def persist_stage_a_block_artifacts(
     """Atomically persist one Stage-A block result without overwriting prior evidence.
 
     The resume checkpoint retains optimizer/RNG state through the existing trusted-local
-    resume format. The JSON result binds that checkpoint hash to the immutable run
-    identity and all numerical evidence supplied by the runner. If writing the JSON
+    resume format. The deterministic numerical-result payload hash is embedded in that
+    checkpoint before its full-file hash is written into the JSON result, so the two
+    artifacts are cryptographically bound without a hash cycle. If writing the JSON
     receipt fails, the newly-created checkpoint is removed so a partial transaction is
     not mistaken for a complete pilot result.
     """
@@ -85,6 +87,8 @@ def persist_stage_a_block_artifacts(
     request.assert_available(identity.block_index, stage)
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
 
+    payload = dict(result_payload)
+    payload_sha = canonical_json_sha256(payload)
     checkpoint_created = False
     try:
         checkpoint_sha = save_pilot_resume_checkpoint(
@@ -94,7 +98,10 @@ def persist_stage_a_block_artifacts(
             identity=identity,
             stage=stage,
             step=int(step),
-            extra={"stage_a_result_schema": STAGE_A_RESULT_SCHEMA},
+            extra={
+                "stage_a_result_schema": STAGE_A_RESULT_SCHEMA,
+                "stage_a_result_payload_sha256": payload_sha,
+            },
         )
         checkpoint_created = True
         receipt = {
@@ -104,7 +111,8 @@ def persist_stage_a_block_artifacts(
             "step": int(step),
             "checkpoint_filename": checkpoint_path.name,
             "checkpoint_sha256": checkpoint_sha,
-            "result": dict(result_payload),
+            "result_payload_sha256": payload_sha,
+            "result": payload,
         }
         result_sha = write_json_atomic(result_path, receipt)
     except BaseException:

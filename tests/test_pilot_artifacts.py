@@ -15,7 +15,7 @@ from minimax_h3_keyless.pilot_artifacts import (
     StageAArtifactRequest,
     persist_stage_a_block_artifacts,
 )
-from minimax_h3_keyless.pilot_campaign import PilotRunIdentity
+from minimax_h3_keyless.pilot_campaign import PilotRunIdentity, canonical_json_sha256
 
 
 class TinyStudentBlock(nn.Module):
@@ -50,6 +50,7 @@ def _identity(run_id="pilot-001") -> PilotRunIdentity:
 def test_stage_a_artifact_transaction_binds_resume_hash_and_refuses_overwrite(tmp_path: Path) -> None:
     student, optimizer = _student_and_optimizer()
     request = StageAArtifactRequest(str(tmp_path), "pilot-001", "deadbeef")
+    payload = {"gate": {"passed": False}, "metric": 1.25}
     receipt = persist_stage_a_block_artifacts(
         request,
         student_block=student,
@@ -57,7 +58,7 @@ def test_stage_a_artifact_transaction_binds_resume_hash_and_refuses_overwrite(tm
         identity=_identity(),
         stage="route",
         step=7,
-        result_payload={"gate": {"passed": False}, "metric": 1.25},
+        result_payload=payload,
     )
     assert receipt.checkpoint_sha256 == sha256_file(receipt.checkpoint_path)
     assert receipt.result_sha256 == sha256_file(receipt.result_path)
@@ -66,6 +67,11 @@ def test_stage_a_artifact_transaction_binds_resume_hash_and_refuses_overwrite(tm
     assert result["checkpoint_sha256"] == receipt.checkpoint_sha256
     assert result["identity"]["run_id"] == "pilot-001"
     assert result["result"]["gate"]["passed"] is False
+    expected_payload_sha = canonical_json_sha256(payload)
+    assert result["result_payload_sha256"] == expected_payload_sha
+    checkpoint = torch.load(receipt.checkpoint_path, map_location="cpu", weights_only=False)
+    assert checkpoint["extra"]["stage_a_result_payload_sha256"] == expected_payload_sha
+    assert checkpoint["extra"]["stage_a_result_schema"] == STAGE_A_RESULT_SCHEMA
     with pytest.raises(FileExistsError, match="immutable"):
         persist_stage_a_block_artifacts(
             request,
