@@ -7,6 +7,7 @@ from pathlib import Path
 
 from minimax_h3_keyless.checkpoint import sha256_file
 from minimax_h3_keyless.contracts import TEACHER_SHA256
+from minimax_h3_keyless.live_capture import discover_clean_git_revision
 from minimax_h3_keyless.pilot_artifacts import StageAArtifactRequest
 from minimax_h3_keyless.pilot_campaign import (
     load_json_manifest,
@@ -27,6 +28,36 @@ from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
 
 
 CAMPAIGN_RESULT_SCHEMA = "minimax_h3_keyless_stage_a_campaign_result_v1"
+
+
+def _require_training_source_provenance(claimed_code_commit: str, capture_comfy_commit: str) -> str:
+    runtime_code_commit = discover_clean_git_revision(
+        Path(__file__).resolve().parents[1],
+        label="MiniMax-H3-Keyless Stage-A training source",
+    )
+    if claimed_code_commit.lower() != runtime_code_commit:
+        raise RuntimeError(
+            "--code-commit does not identify the clean MiniMax-H3-Keyless source executing "
+            f"this campaign: claimed={claimed_code_commit}, actual={runtime_code_commit}"
+        )
+    try:
+        import comfy
+    except ImportError as exc:
+        raise RuntimeError("Stage-A campaign requires the ComfyUI runtime on PYTHONPATH") from exc
+    comfy_file = getattr(comfy, "__file__", None)
+    if not comfy_file:
+        raise RuntimeError("cannot resolve the ComfyUI source root from comfy.__file__")
+    runtime_comfy_commit = discover_clean_git_revision(
+        Path(comfy_file).resolve().parents[1],
+        label="ComfyUI Stage-A training source",
+    )
+    if capture_comfy_commit.lower() != runtime_comfy_commit:
+        raise RuntimeError(
+            "Stage-A training ComfyUI revision differs from the revision that produced the "
+            "capture corpus; recapture or run the campaign under the captured Comfy revision: "
+            f"capture={capture_comfy_commit}, training={runtime_comfy_commit}"
+        )
+    return runtime_comfy_commit
 
 
 def main() -> int:
@@ -74,6 +105,10 @@ def main() -> int:
         raise RuntimeError(
             "capture registry dataset_manifest_sha256 does not match the validated Stage-A dataset"
         )
+    training_comfy_commit = _require_training_source_provenance(
+        args.code_commit,
+        capture_set.comfy_commit,
+    )
     experiment_context_sha = stage_a_experiment_context_sha256(
         dataset_manifest_sha256=capture_set.dataset_manifest_sha256,
         gate_manifest_sha256=gate_sha,
@@ -87,7 +122,7 @@ def main() -> int:
     artifact_request = StageAArtifactRequest(
         output_dir=args.output_dir,
         run_id=args.run_id,
-        code_commit=args.code_commit,
+        code_commit=args.code_commit.lower(),
         experiment_context_sha256=experiment_context_sha,
     )
     campaign_result_path = Path(args.output_dir) / f"{args.run_id}.campaign.result.json"
@@ -153,7 +188,8 @@ def main() -> int:
     payload = {
         "schema": CAMPAIGN_RESULT_SCHEMA,
         "run_id": args.run_id,
-        "code_commit": args.code_commit,
+        "code_commit": args.code_commit.lower(),
+        "training_comfy_commit": training_comfy_commit,
         "experiment_context_sha256": experiment_context_sha,
         "teacher_sha256": teacher_sha,
         "dataset_manifest_sha256": capture_set.dataset_manifest_sha256,
