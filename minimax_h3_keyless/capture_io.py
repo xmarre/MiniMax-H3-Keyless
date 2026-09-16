@@ -13,7 +13,7 @@ from .activation_capture import CapturedPilotCase
 from .checkpoint import sha256_file
 from .contracts import TARGET_MODEL_REVISION, TEACHER_SHA256
 from .pilot import PilotCase
-from .pilot_campaign import PILOT_BLOCKS, _require_sha256, write_json_atomic
+from .pilot_campaign import PILOT_BLOCKS, _require_sha256
 
 
 CAPTURE_BUNDLE_SCHEMA = "minimax_h3_keyless_pilot_capture_bundle_v1"
@@ -162,21 +162,77 @@ def _validate_records(records: Sequence[CapturedPilotCase]) -> tuple[tuple[int, 
     return indices, next(iter(case_ids))
 
 
-def _atomic_torch_save(path: Path, payload: Any) -> None:
+def _publish_temp_no_replace(temporary_name: str, path: Path) -> None:
+    """Atomically publish one same-directory temp file without replacing evidence.
+
+    ``os.replace`` is deliberately not used here: a prior existence check leaves a race
+    in which another capture can publish the same immutable identity before this writer.
+    A hard-link publish is atomic and fails with ``FileExistsError`` if the final path is
+    already occupied while keeping the temporary inode available for identity-checked
+    rollback until both bundle and receipt have been published.
+    """
+    try:
+        os.link(temporary_name, path)
+    except FileExistsError as exc:
+        raise FileExistsError(
+            f"Stage-A capture evidence is immutable and already exists: {path}"
+        ) from exc
+
+
+def _new_temp_path(path: Path) -> tuple[int, str]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    return tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+
+
+def _write_torch_temp(path: Path, payload: Any) -> str:
+    fd, temporary_name = _new_temp_path(path)
     try:
         with os.fdopen(fd, "wb") as handle:
             torch.save(payload, handle)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_name, path)
+        return temporary_name
     except BaseException:
         try:
             os.unlink(temporary_name)
         except FileNotFoundError:
             pass
         raise
+
+
+def _write_json_temp(path: Path, value: Mapping[str, Any]) -> str:
+    encoded = (json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n").encode("utf-8")
+    fd, temporary_name = _new_temp_path(path)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        return temporary_name
+    except BaseException:
+        try:
+            os.unlink(temporary_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _unlink_if_same_file(path: Path, temporary_name: str) -> None:
+    """Rollback only the final link published from our still-live temporary inode."""
+    try:
+        if path.exists() and os.path.samefile(path, temporary_name):
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _unlink_temp(temporary_name: str | None) -> None:
+    if temporary_name is None:
+        return
+    try:
+        os.unlink(temporary_name)
+    except FileNotFoundError:
+        pass
 
 
 def write_captured_pilot_bundle(
@@ -186,8 +242,19 @@ def write_captured_pilot_bundle(
     provenance: CaptureBundleProvenance,
     receipt_path: str | Path | None = None,
 ) -> CaptureBundleWriteResult:
-    """Persist a bounded Stage-A capture plus an independently hashable JSON receipt."""
+    """Persist a bounded Stage-A capture plus an independently hashable JSON receipt.
+
+    Both final paths are published with atomic no-replace semantics. If publishing the
+    receipt fails after this writer published the bundle, the bundle link is rolled back
+    only when it still names this writer's temporary inode. Existing evidence is never
+    overwritten or deleted.
+    """
     path = Path(path)
+    receipt_path = (
+        Path(receipt_path)
+        if receipt_path is not None
+        else path.with_suffix(path.suffix + ".receipt.json")
+    )
     indices, case_id = _validate_records(records)
     record_payloads = [_record_payload(record) for record in records]
     payload = {
@@ -195,35 +262,44 @@ def write_captured_pilot_bundle(
         "provenance": asdict(provenance),
         "records": record_payloads,
     }
-    _atomic_torch_save(path, payload)
-    bundle_sha = sha256_file(path)
-    bundle_bytes = path.stat().st_size
 
-    receipt_path = (
-        Path(receipt_path)
-        if receipt_path is not None
-        else path.with_suffix(path.suffix + ".receipt.json")
-    )
-    receipt = {
-        "schema": CAPTURE_RECEIPT_SCHEMA,
-        "bundle_filename": path.name,
-        "bundle_sha256": bundle_sha,
-        "bundle_bytes": bundle_bytes,
-        "case_id": case_id,
-        "sigma": records[0].case.sigma,
-        "modality_label": records[0].case.modality_label,
-        "block_indices": list(indices),
-        "provenance": asdict(provenance),
-        "records": [_record_summary(record) for record in records],
-    }
+    bundle_temp: str | None = None
+    receipt_temp: str | None = None
+    bundle_published = False
+    receipt_published = False
     try:
-        receipt_sha = write_json_atomic(receipt_path, receipt)
+        bundle_temp = _write_torch_temp(path, payload)
+        _publish_temp_no_replace(bundle_temp, path)
+        bundle_published = True
+        bundle_sha = sha256_file(path)
+        bundle_bytes = path.stat().st_size
+
+        receipt = {
+            "schema": CAPTURE_RECEIPT_SCHEMA,
+            "bundle_filename": path.name,
+            "bundle_sha256": bundle_sha,
+            "bundle_bytes": bundle_bytes,
+            "case_id": case_id,
+            "sigma": records[0].case.sigma,
+            "modality_label": records[0].case.modality_label,
+            "block_indices": list(indices),
+            "provenance": asdict(provenance),
+            "records": [_record_summary(record) for record in records],
+        }
+        receipt_temp = _write_json_temp(receipt_path, receipt)
+        _publish_temp_no_replace(receipt_temp, receipt_path)
+        receipt_published = True
+        receipt_sha = sha256_file(receipt_path)
     except BaseException:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
+        if receipt_published and receipt_temp is not None:
+            _unlink_if_same_file(receipt_path, receipt_temp)
+        if bundle_published and bundle_temp is not None:
+            _unlink_if_same_file(path, bundle_temp)
         raise
+    finally:
+        _unlink_temp(receipt_temp)
+        _unlink_temp(bundle_temp)
+
     return CaptureBundleWriteResult(
         bundle_path=str(path),
         bundle_sha256=bundle_sha,
