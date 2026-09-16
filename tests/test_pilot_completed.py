@@ -11,6 +11,7 @@ import torch.nn as nn
 from minimax_h3_keyless.attention import KeylessAttentionTrain
 from minimax_h3_keyless.pilot import PilotStepReport, set_pilot_block_stage
 from minimax_h3_keyless.pilot_artifacts import StageAArtifactRequest, persist_stage_a_block_artifacts
+from minimax_h3_keyless.pilot_attention_diagnostics import PilotAttentionDiagnostic
 from minimax_h3_keyless.pilot_campaign import (
     GATE_SCHEMA,
     PilotAggregateMetrics,
@@ -68,6 +69,26 @@ def _metric(total: float, attn: float, block: float) -> PilotAggregateMetrics:
     )
 
 
+def _attention_diag(*, kl: float = 0.01) -> PilotAttentionDiagnostic:
+    return PilotAttentionDiagnostic(
+        case_id="hold::sigma=0.5",
+        sigma=0.5,
+        modality_label="video",
+        sampled_query_rows=(0, 1),
+        head_chunk_size=1,
+        key_chunk_size=2,
+        modality_kinds=("video",),
+        mean_centered_logit_nrmse=0.1,
+        mean_teacher_to_student_softmax_kl=kl,
+        pre_out_normalized_rmse=0.1,
+        pre_out_cosine=0.95,
+        post_out_normalized_rmse=0.1,
+        post_out_cosine=0.96,
+        teacher_modality_mass=(1.0,),
+        student_modality_mass=(1.0,),
+    )
+
+
 def _diagnostics(lambda_relative: float) -> RouteActivationFitDiagnostics:
     return RouteActivationFitDiagnostics(
         rows=8,
@@ -109,13 +130,20 @@ def _write_completed(tmp_path: Path):
     selected_metric = _metric(0.50, 0.25, 0.25)
     ls2 = _metric(0.70, 0.45, 0.25)
     candidate = _metric(0.20, 0.10, 0.10)
+    diag = _attention_diag()
     evaluations = (
-        StageAInitializationEvaluation("identity", 0.0, identity_metric),
-        StageAInitializationEvaluation("least_squares", 0.0, ls0, _diagnostics(0.0)),
         StageAInitializationEvaluation(
-            "least_squares", 1e-4, selected_metric, _diagnostics(1e-4)
+            "identity", 0.0, identity_metric, attention_diagnostics=(diag,)
         ),
-        StageAInitializationEvaluation("least_squares", 1e-2, ls2, _diagnostics(1e-2)),
+        StageAInitializationEvaluation(
+            "least_squares", 0.0, ls0, _diagnostics(0.0), (diag,)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, selected_metric, _diagnostics(1e-4), (diag,)
+        ),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-2, ls2, _diagnostics(1e-2), (diag,)
+        ),
     )
     event = PilotTrainingEvent(
         stage="route",
@@ -157,6 +185,7 @@ def _write_completed(tmp_path: Path):
         "identity_baseline": asdict(identity_metric),
         "least_squares_baseline": asdict(selected_metric),
         "candidate": asdict(candidate),
+        "candidate_attention_diagnostics": [asdict(diag)],
         "training_events": [asdict(event)],
         "gate": asdict(gate),
     }
