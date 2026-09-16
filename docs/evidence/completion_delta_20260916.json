@@ -1,0 +1,56 @@
+{
+  "audit_date": "2026-09-16",
+  "purpose": "Completion-time metadata delta after the interrupted design session. This supplements, rather than rewrites, docs/evidence/source_manifest.json. Re-fetch every moving repository and PR before implementation.",
+  "keyless_repository_base": "296cc5a3e3922c073b0564302de3f6a0b8cfc838",
+  "production_prs": {
+    "spectrum_110": {
+      "repository": "xmarre/ComfyUI-Spectrum-MiniMax-H3",
+      "state": "open",
+      "draft": true,
+      "base": "main",
+      "base_sha": "455bd357cb45637c8e852f7f448dc57b52de94f8",
+      "head": "mirror/mixed-grid-measure-pr-clean-20260911",
+      "head_sha": "78a9a5b36c185a55af59a44c073bc7f8e534bc97"
+    },
+    "sol_14": {
+      "repository": "xmarre/ComfyUI-Sol-H3",
+      "state": "open",
+      "draft": true,
+      "base": "feature/mixed-grid-weighted-measure",
+      "base_sha": "fdd52bbd07bd88dfe3d31c823de0d14c27c74aff",
+      "head": "mirror/production-mapped-neighbor-v4-20260916",
+      "head_sha": "8b049e39d000b0d283f2f01e8477f74cf5c2d608",
+      "validation_note": "PR body reports hosted structural/native-interop/windows-provenance CI green; real SM120 and media gates remain open."
+    },
+    "vdn_18": {
+      "repository": "xmarre/ComfyUI-VDN-H3-Plus",
+      "state": "open",
+      "draft": true,
+      "base": "fix/audio-fidelity-controls",
+      "base_sha": "71549c02bc8e73c4c968a43b3955a3998715660d",
+      "head": "mirror/production-query-position-v4-20260916",
+      "head_sha": "333d63f81d33fe29dc1f1f637c5f4a4396880f99",
+      "validation_note": "PR body reports all hosted VDN lanes green; real SM120 and media gates remain open."
+    },
+    "flow_30": {
+      "repository": "xmarre/MiniMax-H3-Flow-Aligned-Regenerate",
+      "state": "open",
+      "draft": true,
+      "base": "main",
+      "base_sha": "970396db839ae7ab431b9718859f6d48a2e5019b",
+      "head": "mirror/mixed-grid-measure-implementation-20260910",
+      "head_sha": "f6a940fdc2fb6d31249a487aff5e4a1297151e9c"
+    },
+    "flow_46": {
+      "repository": "xmarre/MiniMax-H3-Flow-Aligned-Regenerate",
+      "state": "open",
+      "draft": true,
+      "base": "mirror/first-high-contract-implementation-20260914",
+      "base_sha": "4ae2e35f77ed961151ab5695bef9e1dbe277cc54",
+      "head": "mirror/production-mapped-neighbor-validation-v4-20260916",
+      "head_sha": "c67025e7456d54b33b032ab4f2eebba2966aca39",
+      "previous_source_manifest_head": "5970116ef5a04c405f0f2a4c873585a7097b15df",
+      "validation_note": "The PR advanced after the initial source-manifest snapshot. Its current PR body reports hosted CI green, including Ruff/format and source-contract lanes. This completion pass re-fetched PR metadata but did not re-audit every changed source byte at the new head."
+    }
+  }
+}
