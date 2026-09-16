@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence
 import torch
 import torch.nn as nn
 
-from .contracts import PROVIDER_KEY
+from .native_capture_policy import require_plain_native_capture_options
 from .pilot import PilotCase
 from .pilot_campaign import PILOT_BLOCKS
 
@@ -247,10 +247,10 @@ class PilotActivationCapture:
             if not isinstance(options, Mapping):
                 raise RuntimeError("pilot block transformer_options must be a mapping")
             if self.require_plain_native:
-                if PROVIDER_KEY in options:
-                    raise RuntimeError("Stage-A live capture must not run with a Keyless provider installed")
-                if attention_override is not None:
-                    raise RuntimeError("Stage-A live capture must not use a DiTBlock attention override")
+                require_plain_native_capture_options(
+                    options,
+                    attention_override=attention_override,
+                )
 
             layout = options.get("minimax_h3_layout")
             position_ids, layout_context = _layout_capture_context(layout)
