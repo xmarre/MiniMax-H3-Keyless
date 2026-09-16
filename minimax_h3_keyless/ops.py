@@ -80,6 +80,15 @@ def materialize_route(v: torch.Tensor, spec: RoutingSpecV1) -> torch.Tensor:
     return route
 
 
+def _mask_as_additive(mask: torch.Tensor, *, device: torch.device) -> torch.Tensor:
+    if mask.dtype == torch.bool:
+        mask = mask.to(device=device)
+        zeros = torch.zeros((), dtype=torch.float32, device=device)
+        neg_inf = torch.full((), float("-inf"), dtype=torch.float32, device=device)
+        return torch.where(mask, zeros, neg_inf)
+    return mask.to(device=device, dtype=torch.float32)
+
+
 def _broadcast_attention_bias(
     q: torch.Tensor,
     route: torch.Tensor,
@@ -88,7 +97,7 @@ def _broadcast_attention_bias(
 ) -> torch.Tensor | None:
     bias = None
     if mask is not None:
-        bias = mask.to(device=q.device, dtype=torch.float32)
+        bias = _mask_as_additive(mask, device=q.device)
     if log_measure is not None:
         if log_measure.ndim != 1 or log_measure.shape[0] != route.shape[0]:
             raise ValueError(
@@ -120,7 +129,7 @@ def dense_reference_attention(
     rh = route.float().permute(1, 2, 0)
     logits = torch.matmul(qh, rh) * scale
     if mask is not None:
-        logits = logits + mask.to(device=logits.device, dtype=logits.dtype)
+        logits = logits + _mask_as_additive(mask, device=logits.device)
     if log_measure is not None:
         if log_measure.ndim != 1 or log_measure.shape[0] != route.shape[0]:
             raise ValueError("log_measure shape does not match route/value rows")

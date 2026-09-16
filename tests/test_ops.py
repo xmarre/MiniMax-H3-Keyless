@@ -78,6 +78,17 @@ def test_dense_oracle_matches_torch_sdpa_with_measure_and_mask() -> None:
     torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
 
 
+def test_dense_oracle_matches_torch_sdpa_with_boolean_mask() -> None:
+    torch.manual_seed(30)
+    q = torch.randn(2, 2, 4)
+    route = torch.randn(4, 2, 4)
+    v = torch.randn(4, 2, 4)
+    mask = torch.tensor([[True, True, False, True], [True, False, True, True]])
+    expected = dense_reference_attention(q, route, v, mask=mask)
+    actual = torch_sdpa_attention(q, route, v, scale=0.5, mask=mask)
+    torch.testing.assert_close(actual, expected, atol=2e-5, rtol=2e-5)
+
+
 def test_value_row_selection_keeps_v_rope_and_measure_aligned() -> None:
     torch.manual_seed(4)
     v = torch.randn(5, 2, 4)
