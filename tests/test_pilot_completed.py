@@ -22,6 +22,7 @@ from minimax_h3_keyless.pilot_campaign import (
 from minimax_h3_keyless.pilot_completed import load_completed_stage_a_block_evidence
 from minimax_h3_keyless.pilot_gates import evaluate_stage_a_block_gate, stage_a_policy_from_gate_manifest
 from minimax_h3_keyless.pilot_runner import StageAInitializationEvaluation
+from minimax_h3_keyless.route_fit import RouteActivationFitDiagnostics
 
 
 class TinyStudentBlock(nn.Module):
@@ -67,6 +68,18 @@ def _metric(total: float, attn: float, block: float) -> PilotAggregateMetrics:
     )
 
 
+def _diagnostics(lambda_relative: float) -> RouteActivationFitDiagnostics:
+    return RouteActivationFitDiagnostics(
+        rows=8,
+        lambda_relative=lambda_relative,
+        lambda_actual=(lambda_relative, lambda_relative * 2.0),
+        smallest_singular_value=(1.0, 1.25),
+        largest_singular_value=(2.0, 2.5),
+        numerical_rank=(2, 2),
+        full_rank_condition_number=(2.0, 2.0),
+    )
+
+
 def _gate_manifest():
     return {
         "schema": GATE_SCHEMA,
@@ -98,9 +111,11 @@ def _write_completed(tmp_path: Path):
     candidate = _metric(0.20, 0.10, 0.10)
     evaluations = (
         StageAInitializationEvaluation("identity", 0.0, identity_metric),
-        StageAInitializationEvaluation("least_squares", 0.0, ls0),
-        StageAInitializationEvaluation("least_squares", 1e-4, selected_metric),
-        StageAInitializationEvaluation("least_squares", 1e-2, ls2),
+        StageAInitializationEvaluation("least_squares", 0.0, ls0, _diagnostics(0.0)),
+        StageAInitializationEvaluation(
+            "least_squares", 1e-4, selected_metric, _diagnostics(1e-4)
+        ),
+        StageAInitializationEvaluation("least_squares", 1e-2, ls2, _diagnostics(1e-2)),
     )
     event = PilotTrainingEvent(
         stage="route",
