@@ -211,18 +211,20 @@ def validate_int8_convrot_checkpoint(
 ) -> ValidationReport:
     """Validate the exact native Comfy core50/200 INT8 ConvRot storage contract."""
     report = validate_deploy_checkpoint(tensors, metadata)
-    if metadata.get("quantization_recipe") != QUANTIZATION_RECIPE:
+    if metadata.get("quantization_layer_recipe") != QUANTIZATION_RECIPE:
         raise CheckpointValidationError(
-            f"quantization_recipe must be {QUANTIZATION_RECIPE!r}"
+            f"quantization_layer_recipe must be {QUANTIZATION_RECIPE!r}"
         )
     if metadata.get("quantization_format") != "int8_tensorwise":
         raise CheckpointValidationError("quantization_format must be 'int8_tensorwise'")
+    if metadata.get("quantization_per_channel") != "true":
+        raise CheckpointValidationError("quantization_per_channel must be 'true'")
     if metadata.get("quantization_convrot") != "true":
         raise CheckpointValidationError("quantization_convrot must be 'true'")
     if _metadata_int(metadata, "quantization_convrot_groupsize") != 256:
         raise CheckpointValidationError("quantization_convrot_groupsize must be 256")
-    if _metadata_int(metadata, "quantized_linear_count") != CORE_BLOCKS * 4:
-        raise CheckpointValidationError("quantized_linear_count must be 200")
+    if _metadata_int(metadata, "quantization_layer_count") != CORE_BLOCKS * 4:
+        raise CheckpointValidationError("quantization_layer_count must be 200")
 
     target_shapes = _int8_target_shapes()
     expected_descriptors: set[str] = set()
@@ -237,17 +239,17 @@ def validate_int8_convrot_checkpoint(
         if scale_key not in tensors:
             raise CheckpointValidationError(f"missing required tensor: {scale_key}")
         scale_shape = _shape(tensors[scale_key])
-        if scale_shape not in ((shape[0],), (shape[0], 1)):
+        if scale_shape != (shape[0], 1):
             raise CheckpointValidationError(
-                f"{scale_key}: expected one F32 scale per output row, got {scale_shape}"
+                f"{scale_key}: expected F32 per-output-row scale [{shape[0]},1], got {scale_shape}"
             )
         _require_dtype(tensors, scale_key, "F32")
         if descriptor_key not in tensors:
             raise CheckpointValidationError(f"missing required tensor: {descriptor_key}")
         descriptor_shape = _shape(tensors[descriptor_key])
-        if len(descriptor_shape) != 1 or descriptor_shape[0] <= 0:
+        if descriptor_shape != (67,):
             raise CheckpointValidationError(
-                f"{descriptor_key}: expected non-empty U8 JSON descriptor, got {descriptor_shape}"
+                f"{descriptor_key}: expected canonical 67-byte U8 ConvRot descriptor, got {descriptor_shape}"
             )
         _require_dtype(tensors, descriptor_key, "U8")
 

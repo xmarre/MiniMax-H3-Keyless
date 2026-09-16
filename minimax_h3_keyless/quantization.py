@@ -114,7 +114,7 @@ def quantize_convrot_weight(
             "live TensorWiseINT8Layout returned an unexpected ConvRot storage tensor: "
             f"dtype={qdata.dtype}, shape={tuple(qdata.shape)}"
         )
-    if scale.dtype != torch.float32 or scale.numel() != weight.shape[0]:
+    if scale.dtype != torch.float32 or tuple(scale.shape) != (weight.shape[0], 1):
         raise RuntimeError(
             "live TensorWiseINT8Layout returned an unexpected per-output-row scale: "
             f"dtype={scale.dtype}, shape={tuple(scale.shape)}"
@@ -251,11 +251,12 @@ def export_int8_convrot_from_bf16(
     metadata = {k: str(v) for k, v in source_metadata.items() if k != "manifest_sha256"}
     metadata.update(
         {
-            "quantization_recipe": QUANTIZATION_RECIPE,
             "quantization_format": QUANTIZATION_FORMAT,
+            "quantization_layer_recipe": QUANTIZATION_RECIPE,
+            "quantization_layer_count": str(QUANTIZED_LINEAR_COUNT),
+            "quantization_per_channel": "true",
             "quantization_convrot": "true",
             "quantization_convrot_groupsize": str(CONVROT_GROUPSIZE),
-            "quantized_linear_count": str(QUANTIZED_LINEAR_COUNT),
             "quantization_source_bf16_sha256": source_sha,
             "export_commit": str(export_commit),
         }

@@ -78,15 +78,16 @@ def _int8_deploy() -> tuple[dict[str, TensorSignature], dict[str, str]]:
             tensors[weight_key] = _sig(*shape, dtype="I8")
             tensors[weight_key + "_scale"] = _sig(shape[0], 1, dtype="F32")
             descriptor_key = weight_key.removesuffix(".weight") + ".comfy_quant"
-            tensors[descriptor_key] = _sig(64, dtype="U8")
+            tensors[descriptor_key] = _sig(67, dtype="U8")
     metadata = canonical_metadata(training_run="test", export_commit="deadbeef")
     metadata.update(
         {
-            "quantization_recipe": QUANTIZATION_RECIPE,
             "quantization_format": "int8_tensorwise",
+            "quantization_layer_recipe": QUANTIZATION_RECIPE,
+            "quantization_layer_count": "200",
+            "quantization_per_channel": "true",
             "quantization_convrot": "true",
             "quantization_convrot_groupsize": "256",
-            "quantized_linear_count": "200",
         }
     )
     return tensors, metadata
@@ -152,14 +153,14 @@ def test_int8_rejects_wrong_per_output_row_scale_shape() -> None:
     try:
         validate_int8_convrot_checkpoint(tensors, metadata)
     except CheckpointValidationError as exc:
-        assert "one F32 scale per output row" in str(exc)
+        assert "per-output-row scale" in str(exc)
     else:
         raise AssertionError("invalid ConvRot scale geometry must be rejected")
 
 
 def test_int8_rejects_stray_quant_descriptor_outside_200_recipe() -> None:
     tensors, metadata = _int8_deploy()
-    tensors["token_refiner.blocks.0.attn.qkv_proj.comfy_quant"] = _sig(64, dtype="U8")
+    tensors["token_refiner.blocks.0.attn.qkv_proj.comfy_quant"] = _sig(67, dtype="U8")
     try:
         validate_int8_convrot_checkpoint(tensors, metadata)
     except CheckpointValidationError as exc:

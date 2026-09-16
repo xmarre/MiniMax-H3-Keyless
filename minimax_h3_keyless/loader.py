@@ -6,7 +6,7 @@ from typing import Any, Mapping
 
 import torch
 
-from .checkpoint import validate_deploy_checkpoint
+from .checkpoint import validate_deploy_checkpoint, validate_int8_convrot_checkpoint
 from .contracts import (
     CONTRACT_KEY,
     HEAD_DIM,
@@ -62,6 +62,25 @@ def _derive_h3_unet_config(sd: Mapping[str, torch.Tensor], metadata: Mapping[str
     return _merge_metadata_config(cfg, metadata)
 
 
+def _validate_loaded_checkpoint(sd: Mapping[str, Any], metadata: Mapping[str, str]) -> str:
+    """Select the strict validator from storage/metadata and fail closed on mixtures."""
+    has_native_quant_storage = any(key.endswith(".comfy_quant") for key in sd)
+    has_quant_metadata = any(
+        key in metadata
+        for key in (
+            "quantization_format",
+            "quantization_layer_recipe",
+            "quantization_layer_count",
+            "quantization_convrot",
+        )
+    )
+    if has_native_quant_storage or has_quant_metadata:
+        validate_int8_convrot_checkpoint(sd, metadata)
+        return "int8_convrot"
+    validate_deploy_checkpoint(sd, metadata)
+    return "bf16"
+
+
 def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | None = None):
     """Load a canonical Keyless H3 artifact as an ordinary Comfy ModelPatcher."""
     model_options = dict(model_options or {})
@@ -80,7 +99,7 @@ def load_keyless_model(path: str | Path, *, model_options: Mapping[str, Any] | N
     if model_options.get("custom_operations") is None:
         sd, metadata = comfy.utils.convert_old_quants(sd, "", metadata=metadata)
         metadata = dict(metadata or {})
-    validate_deploy_checkpoint(sd, metadata)
+    _validate_loaded_checkpoint(sd, metadata)
 
     parameters = comfy.utils.calculate_parameters(sd)
     weight_dtype = comfy.utils.weight_dtype(sd)

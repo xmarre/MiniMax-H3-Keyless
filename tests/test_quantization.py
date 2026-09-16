@@ -6,11 +6,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from minimax_h3_keyless.contracts import CORE_BLOCKS, HIDDEN_SIZE, INNER_DIM
+from minimax_h3_keyless.contracts import CORE_BLOCKS, HIDDEN_SIZE, INNER_DIM, QUANTIZATION_RECIPE
 from minimax_h3_keyless.quantization import (
     CONVROT_GROUPSIZE,
     QUANTIZATION_FORMAT,
-    QUANTIZATION_RECIPE,
     QUANTIZED_LINEAR_COUNT,
     comfy_quant_descriptor,
     expected_quantized_linear_shapes,
@@ -45,6 +44,7 @@ def test_recipe_shapes_match_keyless_core_geometry_and_groupsize() -> None:
 def test_native_descriptor_is_exact_comfy_int8_convrot_contract() -> None:
     descriptor = comfy_quant_descriptor()
     assert descriptor.dtype == torch.uint8
+    assert descriptor.shape == (67,)
     payload = json.loads(bytes(descriptor.tolist()).decode("utf-8"))
     assert payload == {
         "format": QUANTIZATION_FORMAT,

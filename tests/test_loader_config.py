@@ -5,8 +5,13 @@ import json
 import pytest
 import torch
 
+import minimax_h3_keyless.loader as loader_mod
 from minimax_h3_keyless.contracts import HEADS, HIDDEN_SIZE
-from minimax_h3_keyless.loader import _derive_h3_unet_config, _merge_metadata_config
+from minimax_h3_keyless.loader import (
+    _derive_h3_unet_config,
+    _merge_metadata_config,
+    _validate_loaded_checkpoint,
+)
 
 
 def _minimal_state() -> dict[str, torch.Tensor]:
@@ -41,3 +46,27 @@ def test_metadata_config_rejects_non_object_json() -> None:
 def test_metadata_config_rejects_malformed_json() -> None:
     with pytest.raises(RuntimeError, match="not valid JSON"):
         _merge_metadata_config({}, {"config": "{"})
+
+
+def test_loader_selects_bf16_validator_only_for_unquantized_storage(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(loader_mod, "validate_deploy_checkpoint", lambda sd, md: calls.append("bf16"))
+    monkeypatch.setattr(loader_mod, "validate_int8_convrot_checkpoint", lambda sd, md: calls.append("int8"))
+    assert _validate_loaded_checkpoint({"weight": object()}, {}) == "bf16"
+    assert calls == ["bf16"]
+
+
+def test_loader_selects_strict_int8_validator_from_native_descriptor(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(loader_mod, "validate_deploy_checkpoint", lambda sd, md: calls.append("bf16"))
+    monkeypatch.setattr(loader_mod, "validate_int8_convrot_checkpoint", lambda sd, md: calls.append("int8"))
+    assert _validate_loaded_checkpoint({"layer.comfy_quant": object()}, {}) == "int8_convrot"
+    assert calls == ["int8"]
+
+
+def test_loader_does_not_ignore_quantization_metadata_without_storage(monkeypatch) -> None:
+    calls = []
+    monkeypatch.setattr(loader_mod, "validate_deploy_checkpoint", lambda sd, md: calls.append("bf16"))
+    monkeypatch.setattr(loader_mod, "validate_int8_convrot_checkpoint", lambda sd, md: calls.append("int8"))
+    assert _validate_loaded_checkpoint({}, {"quantization_format": "int8_tensorwise"}) == "int8_convrot"
+    assert calls == ["int8"]
