@@ -15,6 +15,7 @@ from .pilot_artifacts import (
     StageAArtifactReceipt,
     StageAArtifactRequest,
 )
+from .pilot_attention_diagnostics import PilotAttentionDiagnostic
 from .pilot_campaign import (
     RESUME_SCHEMA,
     PilotAggregateMetrics,
@@ -64,6 +65,150 @@ def _finite(name: str, value: Any) -> float:
     if not math.isfinite(out):
         raise RuntimeError(f"{name} must be finite")
     return out
+
+
+def _attention_diagnostic(row: Any) -> PilotAttentionDiagnostic:
+    row = _object(row, "Stage-A attention diagnostic")
+    keys = {
+        "case_id",
+        "sigma",
+        "modality_label",
+        "sampled_query_rows",
+        "head_chunk_size",
+        "key_chunk_size",
+        "modality_kinds",
+        "mean_centered_logit_nrmse",
+        "mean_teacher_to_student_softmax_kl",
+        "pre_out_normalized_rmse",
+        "pre_out_cosine",
+        "post_out_normalized_rmse",
+        "post_out_cosine",
+        "teacher_modality_mass",
+        "student_modality_mass",
+    }
+    _exact_keys(row, keys, "Stage-A attention diagnostic")
+    case_id = row["case_id"]
+    if not isinstance(case_id, str) or not case_id:
+        raise RuntimeError("Stage-A attention diagnostic case_id must be non-empty")
+    sigma = row["sigma"]
+    if sigma is not None:
+        sigma = _finite("Stage-A attention diagnostic sigma", sigma)
+        if not 0.0 <= sigma <= 1.0:
+            raise RuntimeError("Stage-A attention diagnostic sigma must be within [0,1]")
+    modality_label = row["modality_label"]
+    if modality_label is not None and (
+        not isinstance(modality_label, str) or not modality_label
+    ):
+        raise RuntimeError(
+            "Stage-A attention diagnostic modality_label must be null or a non-empty string"
+        )
+
+    sampled = row["sampled_query_rows"]
+    if not isinstance(sampled, list) or not sampled:
+        raise RuntimeError("Stage-A attention diagnostic sampled_query_rows must be non-empty")
+    if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in sampled):
+        raise RuntimeError("Stage-A attention diagnostic query rows must be non-negative integers")
+    if sampled != sorted(set(sampled)):
+        raise RuntimeError("Stage-A attention diagnostic query rows must be sorted and unique")
+
+    chunks: dict[str, int] = {}
+    for name in ("head_chunk_size", "key_chunk_size"):
+        value = row[name]
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise RuntimeError(f"Stage-A attention diagnostic {name} must be a positive integer")
+        chunks[name] = value
+
+    modality_kinds = row["modality_kinds"]
+    if (
+        not isinstance(modality_kinds, list)
+        or not modality_kinds
+        or not all(isinstance(value, str) and value for value in modality_kinds)
+        or len(set(modality_kinds)) != len(modality_kinds)
+    ):
+        raise RuntimeError(
+            "Stage-A attention diagnostic modality_kinds must be unique non-empty strings"
+        )
+
+    centered = _finite(
+        "Stage-A attention diagnostic centered-logit NRMSE",
+        row["mean_centered_logit_nrmse"],
+    )
+    kl = _finite(
+        "Stage-A attention diagnostic teacher-to-student KL",
+        row["mean_teacher_to_student_softmax_kl"],
+    )
+    pre_nrmse = _finite(
+        "Stage-A attention diagnostic pre-out NRMSE", row["pre_out_normalized_rmse"]
+    )
+    pre_cos = _finite("Stage-A attention diagnostic pre-out cosine", row["pre_out_cosine"])
+    post_nrmse = _finite(
+        "Stage-A attention diagnostic post-out NRMSE", row["post_out_normalized_rmse"]
+    )
+    post_cos = _finite("Stage-A attention diagnostic post-out cosine", row["post_out_cosine"])
+    if centered < 0.0 or pre_nrmse < 0.0 or post_nrmse < 0.0:
+        raise RuntimeError("Stage-A attention diagnostic NRMSE values must be non-negative")
+    if kl < -1e-5:
+        raise RuntimeError("Stage-A attention diagnostic KL is materially negative")
+    if not -1.000001 <= pre_cos <= 1.000001 or not -1.000001 <= post_cos <= 1.000001:
+        raise RuntimeError("Stage-A attention diagnostic cosine values are outside [-1,1]")
+
+    masses: dict[str, tuple[float, ...]] = {}
+    for name in ("teacher_modality_mass", "student_modality_mass"):
+        values = row[name]
+        if not isinstance(values, list) or len(values) != len(modality_kinds):
+            raise RuntimeError(
+                f"Stage-A attention diagnostic {name} must align with modality_kinds"
+            )
+        parsed = tuple(
+            _finite(f"Stage-A attention diagnostic {name}", value) for value in values
+        )
+        if any(value < -1e-6 or value > 1.000001 for value in parsed):
+            raise RuntimeError(f"Stage-A attention diagnostic {name} is outside [0,1]")
+        if abs(sum(parsed) - 1.0) > 1e-4:
+            raise RuntimeError(f"Stage-A attention diagnostic {name} does not sum to one")
+        masses[name] = parsed
+
+    return PilotAttentionDiagnostic(
+        case_id=case_id,
+        sigma=sigma,
+        modality_label=modality_label,
+        sampled_query_rows=tuple(sampled),
+        head_chunk_size=chunks["head_chunk_size"],
+        key_chunk_size=chunks["key_chunk_size"],
+        modality_kinds=tuple(modality_kinds),
+        mean_centered_logit_nrmse=centered,
+        mean_teacher_to_student_softmax_kl=kl,
+        pre_out_normalized_rmse=pre_nrmse,
+        pre_out_cosine=pre_cos,
+        post_out_normalized_rmse=post_nrmse,
+        post_out_cosine=post_cos,
+        teacher_modality_mass=masses["teacher_modality_mass"],
+        student_modality_mass=masses["student_modality_mass"],
+    )
+
+
+def _attention_diagnostics(
+    value: Any,
+    cases: tuple[PilotCaseMetrics, ...],
+) -> tuple[PilotAttentionDiagnostic, ...]:
+    if not isinstance(value, list) or not value:
+        raise RuntimeError("Stage-A attention diagnostics must be a non-empty list")
+    diagnostics = tuple(_attention_diagnostic(row) for row in value)
+    expected_ids = tuple(case.case_id for case in cases)
+    actual_ids = tuple(row.case_id for row in diagnostics)
+    if actual_ids != expected_ids:
+        raise RuntimeError("Stage-A attention diagnostic cases do not match aggregate case ordering")
+    for diagnostic, case in zip(diagnostics, cases):
+        if diagnostic.modality_label != case.modality_label:
+            raise RuntimeError(
+                "Stage-A attention diagnostic modality_label does not match aggregate case"
+            )
+        if diagnostic.sigma is None or case.sigma is None:
+            if diagnostic.sigma is not case.sigma:
+                raise RuntimeError("Stage-A attention diagnostic sigma does not match aggregate case")
+        elif not math.isclose(diagnostic.sigma, float(case.sigma), rel_tol=0.0, abs_tol=1e-12):
+            raise RuntimeError("Stage-A attention diagnostic sigma does not match aggregate case")
+    return diagnostics
 
 
 def _route_fit_diagnostics(
@@ -285,7 +430,13 @@ def _initialization(row: Any) -> StageAInitializationEvaluation:
     row = _object(row, "Stage-A initialization evaluation")
     _exact_keys(
         row,
-        {"route_mode", "lambda_relative", "metrics", "route_fit_diagnostics"},
+        {
+            "route_mode",
+            "lambda_relative",
+            "metrics",
+            "route_fit_diagnostics",
+            "attention_diagnostics",
+        },
         "Stage-A initialization evaluation",
     )
     if row["route_mode"] not in ("identity", "least_squares"):
@@ -293,16 +444,19 @@ def _initialization(row: Any) -> StageAInitializationEvaluation:
     lam = _finite("Stage-A initialization lambda_relative", row["lambda_relative"])
     if lam < 0:
         raise RuntimeError("Stage-A initialization lambda_relative must be non-negative")
+    metrics = _aggregate(row["metrics"])
     diagnostics = _route_fit_diagnostics(
         row["route_fit_diagnostics"],
         route_mode=row["route_mode"],
         lambda_relative=lam,
     )
+    attention_diagnostics = _attention_diagnostics(row["attention_diagnostics"], metrics.cases)
     return StageAInitializationEvaluation(
-        row["route_mode"],
-        lam,
-        _aggregate(row["metrics"]),
-        diagnostics,
+        route_mode=row["route_mode"],
+        lambda_relative=lam,
+        metrics=metrics,
+        route_fit_diagnostics=diagnostics,
+        attention_diagnostics=attention_diagnostics,
     )
 
 
@@ -453,7 +607,8 @@ def load_completed_stage_a_block_evidence(
     payload_keys = {
         "block_index", "replay_reports", "initialization_evaluations",
         "selected_route_mode", "selected_lambda_relative", "identity_baseline",
-        "least_squares_baseline", "candidate", "training_events", "gate",
+        "least_squares_baseline", "candidate", "candidate_attention_diagnostics",
+        "training_events", "gate",
     }
     _exact_keys(result_payload, payload_keys, "Stage-A numerical result payload")
     if result_payload["block_index"] != block_index:
@@ -494,6 +649,7 @@ def load_completed_stage_a_block_evidence(
     if asdict(ls_baseline) != asdict(best_ls.metrics):
         raise RuntimeError("completed Stage-A least-squares baseline is inconsistent with initialization grid")
     candidate = _aggregate(result_payload["candidate"])
+    _attention_diagnostics(result_payload["candidate_attention_diagnostics"], candidate.cases)
     events = tuple(_training_event(row) for row in events_raw)
     stored_gate = _gate(result_payload["gate"])
     if stored_gate.block_index != block_index:
