@@ -143,15 +143,17 @@ def test_bounded_attention_diagnostic_matches_dense_streamed_oracle() -> None:
     query_rows = torch.tensor(result.sampled_query_rows, dtype=torch.long)
     direct, pre, post = _dense_reference(teacher, student, record, query_rows)
 
+    expected_centered = direct.centered_logit_nrmse.mean()
+    expected_kl = direct.softmax_kl_teacher_student.mean()
     torch.testing.assert_close(
-        torch.tensor(result.mean_centered_logit_nrmse),
-        direct.centered_logit_nrmse.mean(),
+        torch.tensor(result.mean_centered_logit_nrmse, dtype=expected_centered.dtype),
+        expected_centered,
         atol=1e-6,
         rtol=1e-6,
     )
     torch.testing.assert_close(
-        torch.tensor(result.mean_teacher_to_student_softmax_kl),
-        direct.softmax_kl_teacher_student.mean(),
+        torch.tensor(result.mean_teacher_to_student_softmax_kl, dtype=expected_kl.dtype),
+        expected_kl,
         atol=1e-6,
         rtol=1e-6,
     )
