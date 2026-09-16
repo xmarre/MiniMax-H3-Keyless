@@ -42,7 +42,23 @@ def test_probe_reports_zero_residual_when_k_and_v_match() -> None:
     result = probe_native_head(slices, layer=0, head=0)
     assert result.fixed_value_bilinear_relative_residual < 1e-10
     assert result.key_projection_relative_residual < 1e-10
+    assert result.least_squares[0]["key_fit_relative_residual"] < 1e-10
     assert max(result.principal_angles_degrees_k_v) < 1e-5
+
+
+def test_probe_ls_fit_uses_storage_orientation_not_its_transpose() -> None:
+    torch.manual_seed(52)
+    q = torch.randn(9, 3, dtype=torch.float64)
+    v = torch.randn(9, 3, dtype=torch.float64)
+    storage_route = torch.tensor(
+        [[1.0, 2.0, -0.5], [0.25, -1.0, 3.0], [2.0, 0.5, 1.5]],
+        dtype=torch.float64,
+    )
+    k = v @ storage_route
+    slices = NativeHeadSlices(q, k, v, "q", "k", "v")
+    result = probe_native_head(slices, layer=0, head=0, lambda_relatives=(0.0,))
+    assert result.key_projection_relative_residual < 1e-10
+    assert result.least_squares[0]["key_fit_relative_residual"] < 1e-10
 
 
 def test_teacher_probe_can_explicitly_record_unverified_development_run(tmp_path: Path) -> None:

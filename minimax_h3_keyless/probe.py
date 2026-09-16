@@ -152,7 +152,9 @@ def probe_native_head(
             v,
             lambda_relative=float(lambda_relative),
         )
-        fitted = v @ storage_weight.T
+        # regularized_ls_row_route returns PerHeadLinear storage orientation W.
+        # Its raw K-space fit is C @ W; query execution uses q @ W.T.
+        fitted = v @ storage_weight
         denom = torch.linalg.vector_norm(k)
         relative = (
             float(torch.linalg.vector_norm(fitted - k) / denom)
