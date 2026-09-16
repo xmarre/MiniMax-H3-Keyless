@@ -56,9 +56,9 @@ def _native_projection_geometry(native_attention: nn.Module) -> tuple[torch.Tens
         raise RuntimeError("Stage-A activation route fitting requires a materialized native qkv weight")
     if getattr(weight, "is_meta", False):
         raise RuntimeError("Stage-A activation route fitting cannot use meta-device qkv weights")
-    if weight.dtype != torch.bfloat16:
+    if not weight.is_floating_point():
         raise RuntimeError(
-            f"Stage-A activation route fitting requires the BF16 teacher, got {weight.dtype}"
+            f"Stage-A activation route fitting requires a floating teacher projection, got {weight.dtype}"
         )
     bias = getattr(qkv, "bias", None)
     if bias is not None:
@@ -78,6 +78,10 @@ def collect_route_activation_statistics(
     chunk_rows: int = 512,
 ) -> RouteActivationStatistics:
     """Accumulate LS sufficient statistics from captured post-AdaLN train activations.
+
+    The production Stage-A caller has already validated the pinned BF16 teacher. This
+    helper accepts other floating dtypes only so small synthetic contract tests can run
+    on CPU without weakening the production loader/runner gate.
 
     The teacher K/V projections are evaluated from the exact captured attention input.
     Accumulation stays bounded: only one row chunk plus two ``[heads,d,d]`` FP32
