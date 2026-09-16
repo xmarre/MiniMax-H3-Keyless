@@ -10,6 +10,7 @@ import torch.nn as nn
 
 from .pilot_campaign import (
     PilotRunIdentity,
+    _require_sha256,
     canonical_json_sha256,
     save_pilot_resume_checkpoint,
     write_json_atomic,
@@ -25,6 +26,7 @@ class StageAArtifactRequest:
     output_dir: str
     run_id: str
     code_commit: str
+    experiment_context_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not self.output_dir.strip():
@@ -36,6 +38,10 @@ class StageAArtifactRequest:
             )
         if not self.code_commit.strip():
             raise ValueError("Stage-A artifact code_commit must be non-empty")
+        if self.experiment_context_sha256 is not None:
+            _require_sha256(
+                "Stage-A experiment context SHA-256", self.experiment_context_sha256
+            )
 
     def paths(self, block_index: int, stage: str) -> tuple[Path, Path]:
         root = Path(self.output_dir)
@@ -73,11 +79,11 @@ def persist_stage_a_block_artifacts(
     """Atomically persist one Stage-A block result without overwriting prior evidence.
 
     The resume checkpoint retains optimizer/RNG state through the existing trusted-local
-    resume format. The deterministic numerical-result payload hash is embedded in that
-    checkpoint before its full-file hash is written into the JSON result, so the two
-    artifacts are cryptographically bound without a hash cycle. If writing the JSON
-    receipt fails, the newly-created checkpoint is removed so a partial transaction is
-    not mistaken for a complete pilot result.
+    resume format. The deterministic numerical-result payload hash and, when supplied,
+    the full experiment-context identity are embedded in that checkpoint before its
+    full-file hash is written into the JSON result. This binds resumable evidence without
+    creating a hash cycle. If writing the JSON result fails, the newly-created checkpoint
+    is removed so a partial transaction is not mistaken for a complete pilot result.
     """
     if identity.run_id != request.run_id:
         raise ValueError("Stage-A artifact request run_id does not match pilot identity")
@@ -101,6 +107,7 @@ def persist_stage_a_block_artifacts(
             extra={
                 "stage_a_result_schema": STAGE_A_RESULT_SCHEMA,
                 "stage_a_result_payload_sha256": payload_sha,
+                "stage_a_experiment_context_sha256": request.experiment_context_sha256,
             },
         )
         checkpoint_created = True
@@ -109,6 +116,7 @@ def persist_stage_a_block_artifacts(
             "identity": asdict(identity),
             "stage": stage,
             "step": int(step),
+            "experiment_context_sha256": request.experiment_context_sha256,
             "checkpoint_filename": checkpoint_path.name,
             "checkpoint_sha256": checkpoint_sha,
             "result_payload_sha256": payload_sha,

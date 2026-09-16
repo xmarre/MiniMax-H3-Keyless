@@ -4,7 +4,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 from .checkpoint import sha256_file
 from .pilot import PilotLossWeights
@@ -33,6 +33,48 @@ class StageARunPlan:
     same_input_rtol: float
     plan_identity_sha256: str
     plan_file_sha256: str
+
+
+def stage_a_experiment_context_sha256(
+    *,
+    dataset_manifest_sha256: str,
+    gate_manifest_sha256: str,
+    capture_registry_file_sha256: str,
+    train_plan_identity_sha256: str,
+    capture_code_commit: str,
+    capture_comfy_commit: str,
+    capture_execution_descriptor: str,
+) -> str:
+    """Bind all fixed semantic inputs that must match when resuming a Stage-A campaign."""
+    identities = {
+        "dataset_manifest_sha256": _require_sha256(
+            "Stage-A dataset manifest SHA-256", dataset_manifest_sha256
+        ),
+        "gate_manifest_sha256": _require_sha256(
+            "Stage-A gate manifest SHA-256", gate_manifest_sha256
+        ),
+        "capture_registry_file_sha256": _require_sha256(
+            "Stage-A capture registry file SHA-256", capture_registry_file_sha256
+        ),
+        "train_plan_identity_sha256": _require_sha256(
+            "Stage-A train plan identity SHA-256", train_plan_identity_sha256
+        ),
+    }
+    provenance = {
+        "capture_code_commit": capture_code_commit,
+        "capture_comfy_commit": capture_comfy_commit,
+        "capture_execution_descriptor": capture_execution_descriptor,
+    }
+    for name, value in provenance.items():
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} must be a non-empty string")
+    return canonical_json_sha256(
+        {
+            "schema": "minimax_h3_keyless_stage_a_experiment_context_v1",
+            **identities,
+            **provenance,
+        }
+    )
 
 
 def _read_json_object(path: Path) -> dict[str, Any]:
