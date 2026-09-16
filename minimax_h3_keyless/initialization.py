@@ -6,7 +6,6 @@ from typing import Literal
 import torch
 
 from .attention import KeylessAttentionTrain
-from .diagnostics import regularized_ls_row_route
 
 
 RouteInitMode = Literal["identity", "least_squares"]
@@ -35,12 +34,15 @@ def initialize_training_attention_from_native(
     gate_compress_weight: torch.Tensor | None = None,
     route_mode: RouteInitMode = "identity",
     lambda_relative: float = 0.0,
+    route_storage_weight: torch.Tensor | None = None,
+    lambda_actual: tuple[float, ...] | None = None,
 ) -> RouteInitializationReport:
     """Initialize one block-local Keyless student from its exact native-QKV teacher.
 
     Q and raw retrieval V are copied directly. ``route_norm`` starts from teacher
-    ``k_norm`` only as a scale prior. The teacher K projection is used only to choose
-    the optional least-squares training initialization and is not stored by the student.
+    ``k_norm`` only as a scale prior. Least-squares route weights are deliberately not
+    inferred from projection weights here: Stage A must fit them from captured post-AdaLN
+    train activations and supply the storage-orientation result explicitly.
     """
     inner = student.inner_dim
     hidden = student.hidden
@@ -51,8 +53,8 @@ def initialize_training_attention_from_native(
     _require_shape("k_norm_weight", k_norm_weight, (head_dim,))
     _require_shape("out_proj_weight", out_proj_weight, (hidden, inner))
 
-    q_storage, k_storage, v_storage = qkv_weight.split(inner, dim=0)
-    lambda_actual: tuple[float, ...] | None = None
+    q_storage, _, v_storage = qkv_weight.split(inner, dim=0)
+    report_lambda_actual: tuple[float, ...] | None = None
 
     with torch.no_grad():
         student.q_proj.weight.copy_(q_storage)
@@ -64,29 +66,33 @@ def initialize_training_attention_from_native(
         if route_mode == "identity":
             if lambda_relative != 0.0:
                 raise ValueError("lambda_relative is only meaningful for least_squares initialization")
+            if route_storage_weight is not None or lambda_actual is not None:
+                raise ValueError("identity initialization must not supply an activation LS route")
             student.query_route.reset_identity()
         elif route_mode == "least_squares":
             if lambda_relative < 0:
                 raise ValueError("lambda_relative must be non-negative")
-            route_weights = []
-            lambdas = []
-            for head in range(heads):
-                a = head * head_dim
-                b = a + head_dim
-                storage_weight, lam = regularized_ls_row_route(
-                    k_storage[a:b].T,
-                    v_storage[a:b].T,
-                    lambda_relative=lambda_relative,
+            if route_storage_weight is None or lambda_actual is None:
+                raise ValueError(
+                    "least_squares initialization requires a route fitted from captured train activations"
                 )
-                route_weights.append(storage_weight)
-                lambdas.append(lam)
+            _require_shape(
+                "route_storage_weight",
+                route_storage_weight,
+                (heads, head_dim, head_dim),
+            )
+            if len(lambda_actual) != heads:
+                raise ValueError("lambda_actual must contain one value per attention head")
+            checked_lambdas = tuple(float(value) for value in lambda_actual)
+            if any(not torch.isfinite(torch.tensor(value)) or value < 0.0 for value in checked_lambdas):
+                raise ValueError("lambda_actual values must be finite and non-negative")
             student.query_route.weight.copy_(
-                torch.stack(route_weights).to(
+                route_storage_weight.to(
                     device=student.query_route.weight.device,
                     dtype=student.query_route.weight.dtype,
                 )
             )
-            lambda_actual = tuple(lambdas)
+            report_lambda_actual = checked_lambdas
         else:
             raise ValueError(f"unsupported route initialization mode: {route_mode!r}")
 
@@ -102,7 +108,7 @@ def initialize_training_attention_from_native(
     return RouteInitializationReport(
         mode=route_mode,
         lambda_relative=None if route_mode == "identity" else float(lambda_relative),
-        lambda_actual=lambda_actual,
+        lambda_actual=report_lambda_actual,
     )
 
 
