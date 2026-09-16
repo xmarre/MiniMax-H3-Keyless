@@ -32,6 +32,12 @@ from .pilot_gates import (
     stage_a_policy_from_gate_manifest,
 )
 from .pilot_replay import CapturedReplayReport, pilot_case_to_device, verify_captured_pilot_replay
+from .route_fit import (
+    RouteActivationFit,
+    RouteActivationFitDiagnostics,
+    collect_route_activation_statistics,
+    solve_route_activation_fit,
+)
 
 
 StudentBuilder = Callable[[nn.Module, int, RouteInitMode, float], tuple[nn.Module, object]]
@@ -64,6 +70,7 @@ class StageAInitializationEvaluation:
     route_mode: RouteInitMode
     lambda_relative: float
     metrics: PilotAggregateMetrics
+    route_fit_diagnostics: RouteActivationFitDiagnostics | None = None
 
 
 @dataclass(frozen=True)
@@ -114,6 +121,11 @@ def _default_builder(
     route_mode: RouteInitMode,
     lambda_relative: float,
 ) -> tuple[nn.Module, object]:
+    # Activation-derived LS is installed by this runner after the structural student
+    # is built. Never fall back to the old projection-weight LS approximation.
+    if route_mode == "least_squares":
+        route_mode = "identity"
+        lambda_relative = 0.0
     return build_training_student_block(
         teacher_block,
         block_index=block_index,
@@ -132,6 +144,44 @@ def _move_cases(records, device: str | torch.device):
     return tuple(pilot_case_to_device(record.case, device) for record in records)
 
 
+def _install_activation_route_fit(student: nn.Module, fit: RouteActivationFit) -> None:
+    attention = getattr(student, "attn", None)
+    route = getattr(attention, "query_route", None)
+    weight = getattr(route, "weight", None)
+    if not torch.is_tensor(weight):
+        raise RuntimeError("Stage-A student does not expose a materialized query_route weight")
+    if tuple(weight.shape) != tuple(fit.storage_weight.shape):
+        raise RuntimeError(
+            "Stage-A activation route fit geometry does not match the student query_route"
+        )
+    with torch.no_grad():
+        weight.copy_(fit.storage_weight.to(device=weight.device, dtype=weight.dtype))
+
+
+def _build_student(
+    teacher_block: nn.Module,
+    *,
+    block_index: int,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> nn.Module:
+    if route_mode == "identity":
+        student, _ = student_builder(teacher_block, block_index, "identity", 0.0)
+        return student
+    fit = route_fits.get(float(lambda_relative))
+    if fit is None:
+        raise RuntimeError(
+            f"missing activation-derived Stage-A route fit for lambda={lambda_relative:g}"
+        )
+    # Builders are asked for the exact copied/identity structural student. The only LS
+    # source accepted by the runner is the train-capture fit installed immediately below.
+    student, _ = student_builder(teacher_block, block_index, "identity", 0.0)
+    _install_activation_route_fit(student, fit)
+    return student
+
+
 def select_stage_a_initialization(
     evaluations: Sequence[StageAInitializationEvaluation],
 ) -> StageAInitializationEvaluation:
@@ -145,6 +195,8 @@ def select_stage_a_initialization(
     ls_lambdas = {row.lambda_relative for row in ls_rows}
     if len(ls_rows) != len(PILOT_LS_LAMBDAS) or ls_lambdas != set(PILOT_LS_LAMBDAS):
         raise ValueError(f"Stage-A initialization grid must contain LS lambdas {PILOT_LS_LAMBDAS}")
+    if any(row.route_fit_diagnostics is None for row in ls_rows):
+        raise ValueError("Stage-A LS initialization rows require captured-activation diagnostics")
     return min(
         evaluations,
         key=lambda row: (
@@ -163,6 +215,7 @@ def _evaluate_initialization_grid(
     block_index: int,
     device: str | torch.device,
     weights: PilotLossWeights,
+    route_fits: Mapping[float, RouteActivationFit],
     student_builder: StudentBuilder,
 ) -> tuple[
     tuple[StageAInitializationEvaluation, ...],
@@ -175,15 +228,24 @@ def _evaluate_initialization_grid(
         *(("least_squares", value) for value in PILOT_LS_LAMBDAS),
     )
     for route_mode, lambda_relative in grid:
-        student, _ = student_builder(teacher_block, block_index, route_mode, float(lambda_relative))
+        student = _build_student(
+            teacher_block,
+            block_index=block_index,
+            route_mode=route_mode,
+            lambda_relative=float(lambda_relative),
+            route_fits=route_fits,
+            student_builder=student_builder,
+        )
         student.to(device)
         student.eval()
         metrics = evaluate_pilot_cases(teacher_block, student, holdout_cases, weights=weights)
+        fit = None if route_mode == "identity" else route_fits[float(lambda_relative)]
         evaluations.append(
             StageAInitializationEvaluation(
                 route_mode=route_mode,
                 lambda_relative=float(lambda_relative),
                 metrics=metrics,
+                route_fit_diagnostics=None if fit is None else fit.diagnostics,
             )
         )
         del student
@@ -244,12 +306,12 @@ def run_stage_a_block_pilot(
 ) -> StageABlockPilotResult:
     """Run one bounded Stage-A depth pilot from immutable live captures.
 
-    Initialization is selected only from the fixed holdout corpus. Training follows
-    the predeclared monotonic freeze schedule and creates a fresh optimizer after every
-    transition. If ``artifact_request`` is supplied, the final training-form block,
-    optimizer/RNG state and all numerical evidence are persisted under immutable names.
-    A failed numerical gate is still persisted as evidence; it is never relabeled as an
-    accepted pilot.
+    Initialization is selected only from the fixed holdout corpus. LS route fitting uses
+    only captured post-AdaLN train activations. Training follows the predeclared monotonic
+    freeze schedule and creates a fresh optimizer after every transition. If
+    ``artifact_request`` is supplied, the final training-form block, optimizer/RNG state
+    and all numerical evidence are persisted under immutable names. A failed numerical
+    gate is still persisted as evidence; it is never relabeled as an accepted pilot.
     """
     if block_index not in PILOT_BLOCKS:
         raise ValueError(f"Stage-A pilot block must be one of {PILOT_BLOCKS}")
@@ -276,6 +338,15 @@ def run_stage_a_block_pilot(
         )
         for record in (*train_records, *holdout_records)
     )
+
+    route_statistics = collect_route_activation_statistics(teacher_block.attn, train_records)
+    route_fits = {
+        float(lambda_relative): solve_route_activation_fit(
+            route_statistics,
+            lambda_relative=float(lambda_relative),
+        )
+        for lambda_relative in PILOT_LS_LAMBDAS
+    }
     train_cases = _move_cases(train_records, device)
     holdout_cases = _move_cases(holdout_records, device)
 
@@ -285,15 +356,18 @@ def run_stage_a_block_pilot(
         block_index=block_index,
         device=device,
         weights=loss_weights,
+        route_fits=route_fits,
         student_builder=student_builder,
     )
     identity = next(row for row in evaluations if row.route_mode == "identity")
 
-    student, _ = student_builder(
+    student = _build_student(
         teacher_block,
-        block_index,
-        selected.route_mode,
-        selected.lambda_relative,
+        block_index=block_index,
+        route_mode=selected.route_mode,
+        lambda_relative=selected.lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
     )
     student.to(device)
     events: list[PilotTrainingEvent] = []
