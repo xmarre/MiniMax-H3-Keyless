@@ -75,7 +75,8 @@ def _install_fakes(monkeypatch, model: Core50, prefix: ProgressivePrefix, artifa
         assert model_arg is model
         assert prefix_arg is prefix
         assert receipt is artifact
-        model.blocks[0].attn = KeylessAttentionDeploy(
+        replacement = Block()
+        replacement.attn = KeylessAttentionDeploy(
             4,
             2,
             2,
@@ -83,6 +84,10 @@ def _install_fakes(monkeypatch, model: Core50, prefix: ProgressivePrefix, artifa
             block_index=0,
             dtype=torch.float32,
         )
+        # Mirror the production acceptance contract: the target block object is replaced
+        # atomically rather than mutated in place. This is what lets the outer workflow
+        # retain and restore the exact previous native block if prefix publication fails.
+        model.blocks[0] = replacement
         return prefix.advance(
             block_index=0,
             final_stage="route",
