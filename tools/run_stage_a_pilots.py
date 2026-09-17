@@ -28,6 +28,7 @@ from minimax_h3_keyless.stage_a_campaign_result import (
     STAGE_A_CAMPAIGN_RESULT_SCHEMA,
     load_stage_a_campaign_evidence,
 )
+from minimax_h3_keyless.stage_a_execution_binding import WorkflowBoundStageACaptureSet
 from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
 
 
@@ -94,15 +95,19 @@ def main() -> int:
     registry = load_stage_a_capture_registry(args.capture_registry)
     plan = load_stage_a_run_plan(args.train_plan)
 
-    capture_set = load_stage_a_capture_set_lazy(
+    indexed_capture_set = load_stage_a_capture_set_lazy(
         registry.artifacts,
         dataset,
         required_coverage_tags=CANONICAL_STAGE_A_COVERAGE_TAGS,
     )
-    if registry.dataset_manifest_sha256.lower() != capture_set.dataset_manifest_sha256.lower():
+    if registry.dataset_manifest_sha256.lower() != indexed_capture_set.dataset_manifest_sha256.lower():
         raise RuntimeError(
             "capture registry dataset_manifest_sha256 does not match the validated Stage-A dataset"
         )
+    # The registry builder validates workflow identity when evidence is published. Re-wrap the
+    # lazy corpus so each bundle is independently checked again after deserialization, directly
+    # before training consumes it. This also catches post-registry bundle replacement attempts.
+    capture_set = WorkflowBoundStageACaptureSet(indexed_capture_set, dataset)
     training_comfy_commit = _require_training_source_provenance(
         args.code_commit,
         capture_set.comfy_commit,
