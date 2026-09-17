@@ -9,7 +9,7 @@ import torch
 from .activation_capture import CapturedPilotCase
 from .checkpoint import sha256_file
 from .progressive_capture_io import load_progressive_capture_bundle
-from .progressive_capture_set import ProgressiveBlockCaptureSet
+from .progressive_capture_set import ProgressiveCaptureSet
 
 
 def _tensor_equal(name: str, actual: torch.Tensor | None, expected: torch.Tensor | None) -> None:
@@ -103,89 +103,94 @@ def _compare_annotated_record(
         raise RuntimeError("progressive capture integrity annotated context mismatch")
 
 
-def validate_progressive_capture_set_integrity(
-    captures: ProgressiveBlockCaptureSet,
-) -> None:
-    """Rebind every in-memory Stage-B record to its immutable bundle before persistence.
+def _validate_provenance(captures: ProgressiveCaptureSet, provenance) -> None:
+    if provenance.target_block != captures.target_block:
+        raise RuntimeError("progressive capture artifact target differs from capture-set target")
+    if provenance.prefix_identity_sha256.lower() != captures.prefix_identity_sha256.lower():
+        raise RuntimeError("progressive capture artifact prefix differs from capture-set prefix")
+    if provenance.stage_a_campaign_sha256.lower() != captures.stage_a_campaign_sha256.lower():
+        raise RuntimeError("progressive capture artifact Stage-A identity differs from capture set")
+    if provenance.dataset_manifest_sha256.lower() != captures.dataset_manifest_sha256.lower():
+        raise RuntimeError("progressive capture artifact dataset identity differs from capture set")
+    if provenance.gate_manifest_sha256.lower() != captures.gate_manifest_sha256.lower():
+        raise RuntimeError("progressive capture artifact gate identity differs from capture set")
+    if provenance.code_commit.lower() != captures.code_commit.lower():
+        raise RuntimeError("progressive capture artifact code revision differs from capture set")
+    if provenance.comfy_commit != captures.comfy_commit:
+        raise RuntimeError("progressive capture artifact Comfy revision differs from capture set")
+    if provenance.execution_descriptor != captures.execution_descriptor:
+        raise RuntimeError("progressive capture artifact execution descriptor differs from capture set")
 
-    ``ProgressiveBlockCaptureSet`` is a normal Python dataclass and can be manually
-    constructed or mutated by replacement even though the production loader validates its
-    inputs. This function closes that trust gap at the persistence/acceptance boundary by
-    rehashing every receipt and bundle, reloading every bundle through the safe loader,
-    and requiring the in-memory replay tensors and annotations to equal those immutable
-    bytes exactly.
+
+def validate_progressive_capture_set_integrity(
+    captures: ProgressiveCaptureSet,
+) -> None:
+    """Rebind every Stage-B record to immutable bytes with bounded activation memory.
+
+    Eager capture sets are ordinary Python data and lazy sets reload records from disk, so
+    the persistence/acceptance boundary must independently rehash and compare every record.
+    This implementation never builds a list or dictionary containing loaded capture tensors:
+    it keeps only artifact references plus the current annotated/raw record pair.
     """
 
-    records = [
-        *(("train", record) for record in captures.train),
-        *(("holdout", record) for record in captures.holdout),
-    ]
     refs = tuple(captures.artifact_refs)
-    if len(refs) != len(records):
+    expected_records = len(captures.train) + len(captures.holdout)
+    if len(refs) != expected_records:
         raise RuntimeError(
             "progressive capture integrity requires exactly one immutable artifact per replay record"
         )
     if not refs:
         raise RuntimeError("progressive capture integrity requires immutable artifact references")
 
-    by_receipt: dict[str, tuple[Any, CapturedPilotCase, str]] = {}
+    refs_by_receipt = {}
     for ref in refs:
         receipt_sha = str(ref.receipt_sha256).lower()
-        if receipt_sha in by_receipt:
+        if receipt_sha in refs_by_receipt:
             raise RuntimeError("progressive capture integrity found a duplicate receipt identity")
         if sha256_file(ref.receipt_path).lower() != receipt_sha:
             raise RuntimeError("progressive capture receipt bytes changed after capture-set loading")
-        loaded, provenance = load_progressive_capture_bundle(
-            ref.bundle_path,
-            receipt_path=ref.receipt_path,
-            expected_receipt_sha256=receipt_sha,
-        )
-        bundle_sha = sha256_file(ref.bundle_path).lower()
-        by_receipt[receipt_sha] = (provenance, loaded, bundle_sha)
+        refs_by_receipt[receipt_sha] = ref
 
     seen: set[str] = set()
-    for split, record in records:
-        context = record.case.context
-        if not isinstance(context, Mapping):
-            raise RuntimeError("progressive capture integrity requires mapping context")
-        receipt_sha = context.get("progressive_capture_receipt_sha256")
-        bundle_sha = context.get("progressive_capture_bundle_sha256")
-        if not isinstance(receipt_sha, str) or not isinstance(bundle_sha, str):
-            raise RuntimeError("progressive capture record is missing immutable artifact hashes")
-        receipt_sha = receipt_sha.lower()
-        bundle_sha = bundle_sha.lower()
-        if receipt_sha in seen:
-            raise RuntimeError("progressive capture integrity maps one artifact to multiple records")
-        seen.add(receipt_sha)
-        bound = by_receipt.get(receipt_sha)
-        if bound is None:
-            raise RuntimeError("progressive capture record references an artifact outside its capture set")
-        provenance, raw, actual_bundle_sha = bound
-        if bundle_sha != actual_bundle_sha:
-            raise RuntimeError("progressive capture record bundle hash does not match immutable bytes")
-        if provenance.target_block != captures.target_block:
-            raise RuntimeError("progressive capture artifact target differs from capture-set target")
-        if provenance.prefix_identity_sha256.lower() != captures.prefix_identity_sha256.lower():
-            raise RuntimeError("progressive capture artifact prefix differs from capture-set prefix")
-        if provenance.stage_a_campaign_sha256.lower() != captures.stage_a_campaign_sha256.lower():
-            raise RuntimeError("progressive capture artifact Stage-A identity differs from capture set")
-        if provenance.dataset_manifest_sha256.lower() != captures.dataset_manifest_sha256.lower():
-            raise RuntimeError("progressive capture artifact dataset identity differs from capture set")
-        if provenance.gate_manifest_sha256.lower() != captures.gate_manifest_sha256.lower():
-            raise RuntimeError("progressive capture artifact gate identity differs from capture set")
-        if provenance.code_commit.lower() != captures.code_commit.lower():
-            raise RuntimeError("progressive capture artifact code revision differs from capture set")
-        if provenance.comfy_commit != captures.comfy_commit:
-            raise RuntimeError("progressive capture artifact Comfy revision differs from capture set")
-        if provenance.execution_descriptor != captures.execution_descriptor:
-            raise RuntimeError("progressive capture artifact execution descriptor differs from capture set")
-        _compare_annotated_record(
-            record,
-            raw,
-            split=split,
-            receipt_sha256=receipt_sha,
-            bundle_sha256=actual_bundle_sha,
-        )
+    for split in ("train", "holdout"):
+        for record in captures.records(split):
+            context = record.case.context
+            if not isinstance(context, Mapping):
+                raise RuntimeError("progressive capture integrity requires mapping context")
+            receipt_sha = context.get("progressive_capture_receipt_sha256")
+            bundle_sha = context.get("progressive_capture_bundle_sha256")
+            if not isinstance(receipt_sha, str) or not isinstance(bundle_sha, str):
+                raise RuntimeError("progressive capture record is missing immutable artifact hashes")
+            receipt_sha = receipt_sha.lower()
+            bundle_sha = bundle_sha.lower()
+            if receipt_sha in seen:
+                raise RuntimeError("progressive capture integrity maps one artifact to multiple records")
+            ref = refs_by_receipt.get(receipt_sha)
+            if ref is None:
+                raise RuntimeError(
+                    "progressive capture record references an artifact outside its capture set"
+                )
 
-    if seen != set(by_receipt):
+            raw, provenance = load_progressive_capture_bundle(
+                ref.bundle_path,
+                receipt_path=ref.receipt_path,
+                expected_receipt_sha256=receipt_sha,
+            )
+            actual_bundle_sha = sha256_file(ref.bundle_path).lower()
+            if bundle_sha != actual_bundle_sha:
+                raise RuntimeError(
+                    "progressive capture record bundle hash does not match immutable bytes"
+                )
+            _validate_provenance(captures, provenance)
+            _compare_annotated_record(
+                record,
+                raw,
+                split=split,
+                receipt_sha256=receipt_sha,
+                bundle_sha256=actual_bundle_sha,
+            )
+            seen.add(receipt_sha)
+            del raw
+
+    if seen != set(refs_by_receipt):
         raise RuntimeError("progressive capture integrity found unreferenced immutable artifacts")
