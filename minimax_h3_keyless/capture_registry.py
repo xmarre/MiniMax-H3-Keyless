@@ -20,6 +20,7 @@ from .pilot_campaign import (
     validate_pilot_dataset_manifest,
 )
 from .pilot_inputs import CANONICAL_STAGE_A_COVERAGE_TAGS, CAPTURE_REGISTRY_SCHEMA
+from .stage_a_execution_binding import validate_stage_a_record_workflow_bindings
 
 
 @dataclass(frozen=True)
@@ -87,10 +88,11 @@ def build_stage_a_capture_registry(
     """Build one immutable Stage-A capture registry after streaming bundle validation.
 
     Each capture bundle is hash-checked and deserialized one at a time, then released.
-    This proves exact case×sigma coverage without retaining the full activation corpus in
-    memory merely to construct the registry. The offline pilot runner performs its own
-    independent registry/bundle validation before training. Publication is atomic and
-    no-replace, so a concurrent writer cannot overwrite an existing registry identity.
+    This proves exact case×sigma coverage and the per-case executed-workflow identity without
+    retaining the full activation corpus in memory merely to construct the registry. The
+    offline pilot runner performs its own independent registry/bundle validation before
+    training. Publication is atomic and no-replace, so a concurrent writer cannot overwrite
+    an existing registry identity.
     """
     dataset_manifest = load_json_manifest(dataset_manifest_path)
     dataset_sha = validate_pilot_dataset_manifest(
@@ -154,6 +156,11 @@ def build_stage_a_capture_registry(
             raise ValueError(f"capture case {case_id!r} is absent from the fixed Stage-A manifest")
         if records[0].case.modality_label != manifest_case["modality_label"]:
             raise ValueError(f"capture modality for {case_id!r} does not match the fixed manifest")
+        validate_stage_a_record_workflow_bindings(
+            records,
+            dataset_manifest,
+            expected_split=str(manifest_case["split"]),
+        )
         execution = (case_id, _canonical_sigma(float(sigma)))
         if execution not in expected:
             raise ValueError(
