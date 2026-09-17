@@ -3,10 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from .checkpoint import sha256_file
-from .pilot_campaign import _require_sha256
+from .pilot_campaign import _require_sha256, canonical_json_sha256
 
 
 WORKFLOW_PROMPT_FIELD = "workflow_prompt_sha256"
@@ -37,11 +37,11 @@ def canonical_stage_a_workflow_prompt_sha256(
 ) -> str:
     """Hash the executed API prompt while removing Stage-A capture bookkeeping.
 
-    Comfy injects ``PROMPT`` as the original API prompt sent to the server.  That prompt
+    Comfy injects ``PROMPT`` as the original API prompt sent to the server. That prompt
     contains the generation graph and concrete widget values (prompt text, loader file
-    names, seed/sampler settings, geometry, etc.).  The Stage-A capture node itself adds
+    names, seed/sampler settings, geometry, etc.). The Stage-A capture node itself adds
     bookkeeping inputs that do not change H3 generation semantics and vary across capture
-    destinations/sigma observations.  Those inputs, plus UI-only ``_meta`` dictionaries,
+    destinations/sigma observations. Those inputs, plus UI-only ``_meta`` dictionaries,
     are normalized before hashing so one fixed case graph has one portable semantic hash.
     """
     if not isinstance(prompt, Mapping) or not prompt:
@@ -120,9 +120,9 @@ def validate_stage_a_manifest_assets_for_workflow(
 ) -> None:
     """Bind manifest asset identities to file literals in the executed Comfy prompt.
 
-    Canonical Stage-A evidence is intentionally file-backed.  The API prompt must contain
+    Canonical Stage-A evidence is intentionally file-backed. The API prompt must contain
     every declared ``path_or_uri`` literally and the path resolved by Comfy must hash to the
-    manifest SHA-256.  Remote/dynamic assets without a locally resolvable immutable file are
+    manifest SHA-256. Remote/dynamic assets without a locally resolvable immutable file are
     therefore rejected for the canonical Stage-A corpus instead of being operator-attested.
     """
     assets = case.get("assets", [])
@@ -185,3 +185,88 @@ def require_record_workflow_prompt_sha256(record: Any) -> str:
         raise ValueError(
             f"Stage-A capture record is missing a valid {WORKFLOW_CONTEXT_KEY}"
         ) from exc
+
+
+def _manifest_case_map(manifest: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    cases = manifest.get("cases")
+    if not isinstance(cases, list):
+        raise ValueError("Stage-A workflow binding requires a validated manifest case list")
+    out: dict[str, Mapping[str, Any]] = {}
+    for case in cases:
+        if not isinstance(case, Mapping):
+            raise ValueError("Stage-A workflow binding encountered a non-object case")
+        case_id = case.get("case_id")
+        if not isinstance(case_id, str) or not case_id:
+            raise ValueError("Stage-A workflow binding encountered a case without case_id")
+        out[case_id] = case
+    return out
+
+
+def validate_stage_a_record_workflow_bindings(
+    records: Sequence[Any],
+    manifest: Mapping[str, Any],
+    *,
+    expected_split: str | None = None,
+) -> None:
+    if not records:
+        raise ValueError("Stage-A workflow binding requires captured records")
+    cases = _manifest_case_map(manifest)
+    for record in records:
+        case = getattr(record, "case", None)
+        context = getattr(case, "context", None)
+        if not isinstance(context, Mapping):
+            raise ValueError("Stage-A capture record is missing immutable context")
+        source_case_id = context.get("stage_a_source_case_id")
+        if not isinstance(source_case_id, str) or source_case_id not in cases:
+            raise ValueError("Stage-A capture record source case is absent from the manifest")
+        manifest_case = cases[source_case_id]
+        split = manifest_case.get("split")
+        captured_split = context.get("stage_a_split")
+        if captured_split != split:
+            raise ValueError(
+                f"Stage-A capture split for {source_case_id!r} differs from its manifest"
+            )
+        if expected_split is not None and split != expected_split:
+            raise ValueError(
+                f"Stage-A {expected_split!r} record set contains case {source_case_id!r} "
+                f"from split {split!r}"
+            )
+        expected = require_manifest_case_workflow_prompt_sha256(
+            manifest_case,
+            case_id=source_case_id,
+        )
+        actual = require_record_workflow_prompt_sha256(record)
+        if actual.lower() != expected.lower():
+            raise ValueError(
+                f"Stage-A capture workflow identity for {source_case_id!r} differs from "
+                f"the fixed manifest: expected={expected}, actual={actual}"
+            )
+
+
+class WorkflowBoundStageACaptureSet:
+    """Validate per-case workflow identity whenever Stage-A records are materialized."""
+
+    def __init__(self, capture_set: Any, manifest: Mapping[str, Any]) -> None:
+        expected_dataset = canonical_json_sha256(manifest)
+        actual_dataset = getattr(capture_set, "dataset_manifest_sha256", None)
+        if not isinstance(actual_dataset, str) or actual_dataset.lower() != expected_dataset.lower():
+            raise ValueError(
+                "Stage-A workflow-bound capture set manifest identity does not match its corpus"
+            )
+        self._capture_set = capture_set
+        self._manifest = _json_clone(manifest, label="Stage-A dataset manifest")
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._capture_set, name)
+
+    def records(self, block_index: int, split: str):
+        records = self._capture_set.records(block_index, split)
+        validate_stage_a_record_workflow_bindings(
+            records,
+            self._manifest,
+            expected_split=split,
+        )
+        return records
+
+    def cases(self, block_index: int, split: str):
+        return tuple(record.case for record in self.records(block_index, split))
