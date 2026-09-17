@@ -8,12 +8,31 @@ from types import ModuleType, SimpleNamespace
 from minimax_h3_keyless.progressive import ProgressivePrefix
 
 
+_ENTRYPOINT_LOAD_INDEX = 0
+
+
 def _load_entrypoint():
+    global _ENTRYPOINT_LOAD_INDEX
+    _ENTRYPOINT_LOAD_INDEX += 1
     path = Path(__file__).resolve().parents[1] / "__init__.py"
-    spec = importlib.util.spec_from_file_location("minimax_h3_keyless_comfy_entry", path)
+    package_name = f"_minimax_h3_keyless_comfy_entry_{_ENTRYPOINT_LOAD_INDEX}"
+    spec = importlib.util.spec_from_file_location(
+        package_name,
+        path,
+        submodule_search_locations=[str(path.parent)],
+    )
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    sys.modules[package_name] = module
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        # Comfy loads a custom-node __init__.py as a real package. Mirror that behavior for
+        # the test, then remove the synthetic package tree so repeated loads cannot share
+        # module/class state through sys.modules.
+        for name in tuple(sys.modules):
+            if name == package_name or name.startswith(package_name + "."):
+                sys.modules.pop(name, None)
     return module
 
 
