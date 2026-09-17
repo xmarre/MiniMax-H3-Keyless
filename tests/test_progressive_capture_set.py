@@ -20,6 +20,7 @@ from minimax_h3_keyless.progressive_capture_io import (
 from minimax_h3_keyless.progressive_capture_set import (
     ProgressiveCaptureArtifactRef,
     load_progressive_block_capture_set,
+    load_progressive_block_capture_set_lazy,
 )
 
 
@@ -155,6 +156,32 @@ def test_progressive_capture_set_requires_exact_fixed_dataset_and_annotates_spli
         len(row.case.context["progressive_capture_receipt_sha256"]) == 64
         for row in (*captures.train, *captures.holdout)
     )
+
+
+def test_lazy_progressive_capture_set_reloads_only_requested_artifact(tmp_path: Path) -> None:
+    manifest = _manifest()
+    prefix = _prefix(canonical_json_sha256(manifest))
+    artifacts = _all_artifacts(tmp_path, prefix)
+    captures = load_progressive_block_capture_set_lazy(
+        artifacts,
+        manifest,
+        prefix,
+        minimum_cases=2,
+        minimum_sigma_strata=2,
+    )
+
+    assert len(captures.train) == 2
+    assert len(captures.holdout) == 2
+    first = captures.train[0]
+    assert first.case.context["progressive_source_case_id"] == "train-a"
+    assert first.case.context["progressive_split"] == "train"
+
+    # Index construction must not retain the activation tensors as an eager fallback.
+    # Removing the immutable source after indexing makes a subsequent access fail rather
+    # than returning a cached record.
+    Path(captures.executions[0].artifact.bundle_path).unlink()
+    with pytest.raises(FileNotFoundError):
+        _ = captures.train[0]
 
 
 def test_progressive_capture_set_rejects_missing_execution(tmp_path: Path) -> None:
