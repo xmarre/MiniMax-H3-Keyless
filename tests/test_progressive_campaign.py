@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ from minimax_h3_keyless.progressive_campaign import (
     run_progressive_block_campaign,
 )
 from minimax_h3_keyless.progressive_gates import ProgressiveExecutionPolicy
+from minimax_h3_keyless.progressive_training_resume import ProgressiveTrainingResumeRequest
 
 
 def _prefix() -> ProgressivePrefix:
@@ -58,6 +60,8 @@ def _inputs() -> ProgressiveBlockRunInputs:
             loss_weights=SimpleNamespace(),
             same_input_atol=0.0,
             same_input_rtol=0.0,
+            plan_identity_sha256="1" * 64,
+            plan_file_sha256="2" * 64,
         ),
         execution_policy=ProgressiveExecutionPolicy(fold_atol=0.002, fold_rtol=0.003),
     )
@@ -68,6 +72,7 @@ def _install_runtime_fakes(monkeypatch, *, gate_passed: bool):
     captures = SimpleNamespace()
     artifact = _artifact()
     calls = []
+    training_kwargs = {}
 
     monkeypatch.setattr(campaign, "require_progressive_runtime_provenance", lambda inputs: "comfy")
     monkeypatch.setattr(campaign, "load_progressive_training_captures", lambda inputs: captures)
@@ -85,41 +90,63 @@ def _install_runtime_fakes(monkeypatch, *, gate_passed: bool):
         block_index=0,
         gate=SimpleNamespace(passed=gate_passed),
     )
-    monkeypatch.setattr(
-        campaign,
-        "run_progressive_block_training",
-        lambda *args, **kwargs: result,
-    )
+
+    def fake_train(*args, **kwargs):
+        training_kwargs.update(kwargs)
+        return result
+
+    monkeypatch.setattr(campaign, "run_progressive_block_training", fake_train)
     monkeypatch.setattr(
         campaign,
         "persist_progressive_block_artifacts",
         lambda *args, **kwargs: artifact,
     )
-    return model, captures, artifact, result, calls
+    monkeypatch.setattr(
+        campaign,
+        "remove_progressive_training_resume",
+        lambda path: calls.append(("remove-resume", str(path))),
+    )
+    return model, captures, artifact, result, calls, training_kwargs
 
 
 def test_failed_progressive_candidate_is_persisted_but_never_accepted(monkeypatch) -> None:
-    _, _, artifact, _, calls = _install_runtime_fakes(monkeypatch, gate_passed=False)
+    _, _, artifact, _, calls, training_kwargs = _install_runtime_fakes(
+        monkeypatch, gate_passed=False
+    )
 
     def forbidden_accept(*args, **kwargs):
         raise AssertionError("failed progressive candidate must not reach acceptance")
 
     monkeypatch.setattr(campaign, "accept_persisted_progressive_block", forbidden_accept)
+    inputs = _inputs()
     outcome = run_progressive_block_campaign(
-        _inputs(),
+        inputs,
         teacher_path="teacher.safetensors",
         artifact_dir="artifacts",
         device="cuda:0",
     )
 
-    assert calls == [("restore", "artifacts")]
+    assert calls == [
+        ("restore", "artifacts"),
+        ("remove-resume", "artifacts/campaign.block00.training-resume.pt"),
+    ]
+    request = training_kwargs["resume_request"]
+    assert isinstance(request, ProgressiveTrainingResumeRequest)
+    assert request.path == "artifacts/campaign.block00.training-resume.pt"
+    assert request.resume is False
+    assert request.prefix_manifest_sha256 == inputs.prefix_manifest_sha256
+    assert request.capture_registry_file_sha256 == inputs.registry.registry_file_sha256
+    assert request.train_plan_identity_sha256 == inputs.train_plan.plan_identity_sha256
+    assert request.train_plan_file_sha256 == inputs.train_plan.plan_file_sha256
     assert outcome.gate_passed is False
     assert outcome.artifact is artifact
     assert outcome.accepted is None
 
 
 def test_passed_progressive_candidate_accepts_the_same_persisted_artifact(monkeypatch) -> None:
-    _, captures, artifact, result, _ = _install_runtime_fakes(monkeypatch, gate_passed=True)
+    _, captures, artifact, result, calls, training_kwargs = _install_runtime_fakes(
+        monkeypatch, gate_passed=True
+    )
     accepted = SimpleNamespace(prefix_manifest_path="next.json")
     seen = {}
 
@@ -139,6 +166,8 @@ def test_passed_progressive_candidate_accepts_the_same_persisted_artifact(monkey
         teacher_path="teacher.safetensors",
         artifact_dir="artifacts",
         device="cuda:0",
+        resume=True,
+        resume_path="scratch/recover.pt",
     )
 
     assert outcome.gate_passed is True
@@ -149,6 +178,37 @@ def test_passed_progressive_candidate_accepts_the_same_persisted_artifact(monkey
     assert seen["kwargs"]["fold_atol"] == 0.002
     assert seen["kwargs"]["fold_rtol"] == 0.003
     assert seen["kwargs"]["current_prefix_manifest_sha256"] == inputs.prefix_manifest_sha256
+    request = training_kwargs["resume_request"]
+    assert request.path == "scratch/recover.pt"
+    assert request.resume is True
+    assert calls[-1] == ("remove-resume", "scratch/recover.pt")
+
+
+def test_campaign_keeps_recovery_checkpoint_when_immutable_persistence_fails(monkeypatch) -> None:
+    _, _, _, _, calls, _ = _install_runtime_fakes(monkeypatch, gate_passed=True)
+
+    def fail_persist(*args, **kwargs):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(campaign, "persist_progressive_block_artifacts", fail_persist)
+    with pytest.raises(RuntimeError, match="disk full"):
+        run_progressive_block_campaign(
+            _inputs(),
+            teacher_path="teacher.safetensors",
+            artifact_dir="artifacts",
+            device="cuda:0",
+        )
+    assert not any(kind == "remove-resume" for kind, *_ in calls)
+
+
+def test_default_recovery_path_is_prefix_and_block_scoped() -> None:
+    prefix = _prefix()
+    assert campaign._training_resume_path("/tmp/out", prefix, 7, None) == Path(
+        "/tmp/out/campaign.block07.training-resume.pt"
+    )
+    assert campaign._training_resume_path("/tmp/out", prefix, 7, "/tmp/custom.pt") == Path(
+        "/tmp/custom.pt"
+    )
 
 
 def test_progressive_input_binding_rejects_train_plan_drift(monkeypatch) -> None:
