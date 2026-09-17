@@ -11,7 +11,7 @@ from minimax_h3_keyless.attention import KeylessAttentionTrain
 from minimax_h3_keyless.initialization import initialize_training_attention_from_native
 from minimax_h3_keyless.ops import normalized_positioned, torch_sdpa_attention
 from minimax_h3_keyless.pilot import PilotCase, set_pilot_block_stage
-from minimax_h3_keyless.pilot_campaign import GATE_SCHEMA, validate_pilot_gate_manifest
+from minimax_h3_keyless.pilot_campaign import GATE_SCHEMA, PILOT_LS_LAMBDAS, validate_pilot_gate_manifest
 from minimax_h3_keyless.pilot_runner import StageATrainStage
 from minimax_h3_keyless.progressive import PROGRESSIVE_PREFIX_CONTEXT_KEY, ProgressivePrefix
 from minimax_h3_keyless.progressive_capture_set import ProgressiveBlockCaptureSet
@@ -209,6 +209,7 @@ def test_progressive_runner_replays_same_input_trains_without_accepting_prefix()
 
     assert result.block_index == 0
     assert result.prefix_identity_sha256 == prefix.identity_sha256
+    assert result.selection_split == "train_complete_cases"
     assert prefix.accepted_blocks == ()
     assert prefix.next_block == 0
     assert isinstance(teacher.attn, TinyNativeAttention)
@@ -220,6 +221,20 @@ def test_progressive_runner_replays_same_input_trains_without_accepting_prefix()
     assert len(result.candidate_attention_diagnostics) == 2
     assert len(result.training_events) == 2
     assert result.final_stage == "route"
+
+    train_ids = tuple(record.case.case_id for record in captures.train)
+    holdout_ids = tuple(record.case.case_id for record in captures.holdout)
+    assert set(train_ids).isdisjoint(holdout_ids)
+    for row in result.initialization_evaluations:
+        assert tuple(case.case_id for case in row.metrics.cases) == train_ids
+        assert tuple(diag.case_id for diag in row.attention_diagnostics) == train_ids
+    assert tuple(case.case_id for case in result.identity_baseline.cases) == holdout_ids
+    assert tuple(case.case_id for case in result.least_squares_baseline.cases) == holdout_ids
+    assert tuple(case.case_id for case in result.candidate.cases) == holdout_ids
+    assert tuple(diag.case_id for diag in result.candidate_attention_diagnostics) == holdout_ids
+    assert {event.case_id for event in result.training_events} == set(train_ids)
+    assert result.least_squares_baseline_lambda_relative in PILOT_LS_LAMBDAS
+
     assert any(parameter.requires_grad for parameter in result.student_block.parameters())
     optimized = {
         id(parameter)
