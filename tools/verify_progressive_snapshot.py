@@ -8,15 +8,16 @@ import torch
 
 from minimax_h3_keyless.live_capture import discover_clean_git_revision
 from minimax_h3_keyless.progressive_authorization import load_progressive_prefix_manifest
-from minimax_h3_keyless.progressive_snapshot import load_progressive_snapshot_into_native_model
+from minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
 from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Reload a Stage-B mixed QV/QKV snapshot into a fresh pinned native H3 model. "
-            "This proves snapshot topology/state loading; it is not a denoiser or media parity test."
+            "Reload a Stage-B mixed QV/QKV snapshot into a fresh pinned native H3 model "
+            "using bounded tensor-at-a-time safetensors reads. This proves snapshot "
+            "topology/state loading; it is not a denoiser or media parity test."
         )
     )
     parser.add_argument("--teacher", required=True, help="Exact pinned native BF16 teacher safetensors")
@@ -39,7 +40,7 @@ def main() -> int:
     teacher = load_pinned_bf16_teacher(args.teacher)
     model = teacher.diffusion_model
     model.to(torch.device("cpu"))
-    load_progressive_snapshot_into_native_model(
+    load_progressive_snapshot_streaming(
         model,
         args.snapshot,
         prefix,
@@ -50,6 +51,7 @@ def main() -> int:
     print(f"Snapshot reload validated: {args.snapshot}")
     print(f"Prefix identity SHA-256: {prefix.identity_sha256}")
     print(f"Accepted blocks: {len(prefix.accepted)}")
+    print("Reload mode: bounded tensor-at-a-time safetensors streaming")
     print("Scope: structural mixed-topology/state reload only; no numerical/media parity claim")
     return 0
 
