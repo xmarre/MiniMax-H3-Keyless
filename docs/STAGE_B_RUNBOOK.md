@@ -4,6 +4,8 @@ This runbook covers Phase 4 of `KEYLESS_H3_IMPLEMENTATION_DESIGN.md`: early-to-l
 
 Stage B is deliberately iterative. For target block `i`, the capture corpus must come from the exact accepted prefix `0..i-1`; the original native QKV block `i` is then trained/evaluated against the Keyless candidate on those same live hidden inputs. A failed candidate is persisted as evidence but does not advance the prefix.
 
+Stage-B initialization/model-selection evidence and the Stage-B numerical exit gate are separate datasets within the fixed corpus. Identity-versus-LS initialization and the LS regularization choice are selected on complete **training** cases only. The fixed holdout is then used only to evaluate the two train-selected untrained baselines and the trained candidate for the frozen exit gate. Do not use the holdout to choose initialization, LS lambda, train stages or architecture escalation.
+
 ## 1. Freeze the complete policy before Stage A
 
 The gate manifest used for Stage A is also the hash-bound Stage-B policy. In addition to all required `stage_a_*` thresholds, it must contain these predeclared non-negative finite thresholds before Stage-A evidence is produced:
@@ -17,7 +19,7 @@ The gate manifest used for Stage A is also the hash-bound Stage-B policy. In add
 
 The values above are only syntax examples, not recommended tolerances. Choose them from calibration evidence before observing the full progressive sweep. Stage-B authorization rejects a gate manifest that does not already contain both values. Do not add or loosen them after Stage A under the same experiment identity: changing the gate manifest changes its hash and invalidates the authorized prefix.
 
-Stage B also requires the exact Stage-A train-plan file. Both its canonical semantic identity and full file SHA-256 are checked against the passed Stage-A campaign result.
+Stage B also requires the exact Stage-A train-plan file. Both its canonical semantic identity and full file SHA-256 are checked against the passed Stage-A campaign result. Canonical v3 plans contain `route`, optional `query`, and optional `value` in monotonic order. They do **not** contain `norm_out`; copied `q_norm`/`out_proj` escalation remains deferred until a separately predeclared train-only calibration/plateau contract exists. The Stage-B exit holdout may not authorize that escalation either.
 
 ## 2. Authorize the empty progressive prefix
 
@@ -90,15 +92,18 @@ The runner then:
 1. loads the exact pinned native BF16 teacher;
 2. reconstructs the already accepted prefix from immutable progressive artifacts;
 3. leaves the current target block in its original native QKV form;
-4. verifies native same-input replay for every current-prefix capture;
-5. computes bounded activation-derived least-squares route statistics on train captures;
-6. evaluates the fixed identity/least-squares initialization grid on holdout captures;
-7. trains the fixed monotonic plan (`route -> query -> value -> norm_out`, limited to the stages declared by the Stage-A plan);
-8. atomically replaces a mutable crash-recovery checkpoint after every **complete epoch** with q/R/v student state, current-stage optimizer state, Python/NumPy/Torch RNG state and prior training events;
-9. recomputes the frozen numerical gate on holdout evidence;
-10. persists the immutable candidate result/resume pair regardless of pass/fail;
-11. removes the mutable crash-recovery file only after that immutable candidate transaction succeeds;
-12. only if the gate passes, folds the training route into deploy Q, verifies fold parity using the predeclared `progressive_fold_atol/rtol`, installs the target block and atomically publishes the next hash-chained prefix manifest.
+4. verifies native same-input replay for every current-prefix train and holdout capture;
+5. computes bounded activation-derived least-squares route statistics on train captures only;
+6. evaluates the fixed identity/least-squares initialization grid on complete **training** captures only, records `selection_split=train_complete_cases`, and selects identity versus LS plus the LS lambda from that training evidence;
+7. evaluates the untrained identity baseline and the **train-selected LS baseline** on the untouched complete-case holdout;
+8. trains the fixed canonical plan (`route -> query -> value`, limited to stages declared by the Stage-A v3 plan) on training captures only;
+9. atomically replaces a mutable crash-recovery checkpoint after every **complete epoch** with q/R/v student state, current-stage optimizer state, Python/NumPy/Torch RNG state and prior training events;
+10. evaluates the trained candidate on the same untouched holdout and recomputes the frozen numerical gate against the held-out identity and train-selected-LS baselines;
+11. persists the immutable candidate result/resume pair regardless of pass/fail, including the train-only selection marker and train-selected LS-baseline lambda;
+12. removes the mutable crash-recovery file only after that immutable candidate transaction succeeds;
+13. only if the gate passes, independently revalidates the train-selection/holdout case separation, folds the training route into deploy Q, verifies fold parity using the predeclared `progressive_fold_atol/rtol`, installs the target block and atomically publishes the next hash-chained prefix manifest.
+
+The current immutable Stage-B result/resume evidence schemas are v2. The mutable training-recovery schema is also v2. These versions deliberately reject pre-isolation v1 artifacts/resume files, because v1 did not attest that initialization/LS-lambda selection was isolated from the exit holdout. No v1 artifact should be promoted into an accepted v2 prefix by relabeling or editing it.
 
 The default recovery path is:
 
@@ -106,7 +111,9 @@ The default recovery path is:
 <output-dir>/<sweep-id>.blockNN.training-resume.pt
 ```
 
-A fresh run refuses to overwrite an existing recovery checkpoint. After interruption, rerun the exact same command with `--resume`; all prefix-manifest, capture-registry, train-plan, selected-initialization and source identities must still match. An alternate scratch path may be declared explicitly with `--resume-path`. Recovery resumes only from completed epochs. If interruption happens partway through an epoch, that epoch is replayed from the preceding completed-epoch checkpoint rather than treating a partial optimizer sequence as complete evidence. Resume validation also requires the stored `(stage, epoch, case_id)` event sequence to match the exact current capture traversal; an event list with the right count but different order or case identity is rejected.
+A fresh run refuses to overwrite an existing recovery checkpoint. After interruption, rerun the exact same command with `--resume`; all prefix-manifest, capture-registry, train-plan, train-selected-initialization and source identities must still match. An alternate scratch path may be declared explicitly with `--resume-path`. Recovery resumes only from completed epochs. If interruption happens partway through an epoch, that epoch is replayed from the preceding completed-epoch checkpoint rather than treating a partial optimizer sequence as complete evidence. Resume validation also requires the stored `(stage, epoch, case_id)` event sequence to match the exact current training-capture traversal; an event list with the right count but different order or case identity is rejected.
+
+The holdout is an exit-gate dataset. Do not inspect it to choose identity versus LS, choose the LS regularization value, change the train plan, decide whether to unfreeze copied `q_norm`/`out_proj`, or tune thresholds under the same sweep identity. Any such change requires a new predeclared experiment/evidence contract; the current holdout cannot be recycled as the selector.
 
 A failed numerical gate returns exit code `2`. Its candidate artifacts remain immutable evidence, but the current prefix manifest and live accepted model are unchanged. A fold/parity/publication failure raises and the live target block is restored; persisted candidate evidence still does not become accepted without the next prefix manifest.
 
@@ -152,7 +159,7 @@ If a candidate fails, diagnose it under a new experiment/artifact identity. The 
 
 ## 8. Stage-B exit and canonical BF16 handoff
 
-Structural unit tests establish serialization, provenance, rollback, lazy-memory, crash-recovery, mixed-snapshot and orchestration contracts. They do not establish that H3 outputs remain visually/audibly acceptable.
+Structural unit tests establish serialization, provenance, rollback, lazy-memory, crash-recovery, mixed-snapshot, train/holdout isolation and orchestration contracts. They do not establish that H3 outputs remain visually/audibly acceptable.
 
 Phase 4 exits only after all 50 core blocks have been empirically accepted under the fixed sweep and the required periodic full-model checks have been run. The deploy form contains QV plus the folded route; the training-only `query_route` must not remain in deployable artifacts. Generation-level validation, ecosystem reference compatibility, INT8 ConvRot validation and measured performance remain later phases of the authoritative design.
 
