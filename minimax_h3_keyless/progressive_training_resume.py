@@ -20,7 +20,7 @@ from .pilot_campaign import (
 )
 
 
-PROGRESSIVE_TRAINING_RESUME_SCHEMA = "minimax_h3_keyless_progressive_training_resume_v1"
+PROGRESSIVE_TRAINING_RESUME_SCHEMA = "minimax_h3_keyless_progressive_training_resume_v2"
 _STAGE_NAMES = ("route", "query", "value", "norm_out")
 
 
