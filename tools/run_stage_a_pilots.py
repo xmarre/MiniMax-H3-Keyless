@@ -15,7 +15,7 @@ from minimax_h3_keyless.pilot_campaign import (
     validate_pilot_gate_manifest,
 )
 from minimax_h3_keyless.pilot_capture_lazy import load_stage_a_capture_set_lazy
-from minimax_h3_keyless.pilot_completed import load_completed_stage_a_block_evidence
+from minimax_h3_keyless.pilot_completed_v3 import load_completed_stage_a_block_evidence
 from minimax_h3_keyless.pilot_gates import evaluate_stage_a_campaign_gate
 from minimax_h3_keyless.pilot_inputs import (
     CANONICAL_STAGE_A_COVERAGE_TAGS,

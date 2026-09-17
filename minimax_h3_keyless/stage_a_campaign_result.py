@@ -9,7 +9,8 @@ from .checkpoint import sha256_file
 from .contracts import TEACHER_SHA256
 from .pilot_artifacts import STAGE_A_RESULT_SCHEMA, StageAArtifactReceipt, StageAArtifactRequest
 from .pilot_campaign import PILOT_BLOCKS, _require_sha256, validate_pilot_gate_manifest
-from .pilot_completed import CompletedStageABlockEvidence, load_completed_stage_a_block_evidence
+from .pilot_completed import CompletedStageABlockEvidence
+from .pilot_completed_v3 import load_completed_stage_a_block_evidence
 from .pilot_gates import StageACampaignGateResult, evaluate_stage_a_campaign_gate
 
 

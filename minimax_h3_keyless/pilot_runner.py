@@ -47,6 +47,7 @@ from .route_fit import (
 
 StudentBuilder = Callable[[nn.Module, int, RouteInitMode, float], tuple[nn.Module, object]]
 OptimizerFactory = Callable[[Sequence[nn.Parameter], float, float], torch.optim.Optimizer]
+_SELECTION_SPLIT = "train_complete_cases"
 
 
 @dataclass(frozen=True)
@@ -88,6 +89,7 @@ class StageABlockPilotResult:
     selected_lambda_relative: float
     identity_baseline: PilotAggregateMetrics
     least_squares_baseline: PilotAggregateMetrics
+    least_squares_baseline_lambda_relative: float
     candidate: PilotAggregateMetrics
     candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...]
     training_events: tuple[PilotTrainingEvent, ...]
@@ -205,11 +207,11 @@ def _evaluate_attention_diagnostics(
         for record in records
     )
     if not diagnostics:
-        raise RuntimeError("Stage-A attention diagnostics require at least one holdout capture")
+        raise RuntimeError("Stage-A attention diagnostics require at least one capture")
     case_ids = tuple(row.case_id for row in diagnostics)
     expected = tuple(record.case.case_id for record in records)
     if case_ids != expected:
-        raise RuntimeError("Stage-A attention diagnostic case ordering diverged from holdout captures")
+        raise RuntimeError("Stage-A attention diagnostic case ordering diverged from captures")
     return diagnostics
 
 
@@ -240,8 +242,8 @@ def select_stage_a_initialization(
 
 def _evaluate_initialization_grid(
     teacher_block: nn.Module,
-    holdout_cases,
-    holdout_records,
+    cases,
+    records,
     *,
     block_index: int,
     device: str | torch.device,
@@ -269,9 +271,9 @@ def _evaluate_initialization_grid(
         )
         student.to(device)
         student.eval()
-        metrics = evaluate_pilot_cases(teacher_block, student, holdout_cases, weights=weights)
+        metrics = evaluate_pilot_cases(teacher_block, student, cases, weights=weights)
         attention_diagnostics = _evaluate_attention_diagnostics(
-            teacher_block, student, holdout_records
+            teacher_block, student, records
         )
         fit = None if route_mode == "identity" else route_fits[float(lambda_relative)]
         evaluations.append(
@@ -298,14 +300,43 @@ def _evaluate_initialization_grid(
     return tuple(evaluations), selected, best_ls
 
 
+def _evaluate_untrained_baseline(
+    teacher_block: nn.Module,
+    cases,
+    *,
+    block_index: int,
+    device: str | torch.device,
+    weights: PilotLossWeights,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> PilotAggregateMetrics:
+    student = _build_student(
+        teacher_block,
+        block_index=block_index,
+        route_mode=route_mode,
+        lambda_relative=lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    student.to(device)
+    student.eval()
+    try:
+        return evaluate_pilot_cases(teacher_block, student, cases, weights=weights)
+    finally:
+        del student
+
+
 def _result_payload(
     *,
     block_index: int,
     replay_reports: tuple[CapturedReplayReport, ...],
     evaluations: tuple[StageAInitializationEvaluation, ...],
     selected: StageAInitializationEvaluation,
-    identity: StageAInitializationEvaluation,
-    best_ls: StageAInitializationEvaluation,
+    identity_baseline: PilotAggregateMetrics,
+    least_squares_baseline: PilotAggregateMetrics,
+    least_squares_baseline_lambda_relative: float,
     candidate: PilotAggregateMetrics,
     candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...],
     events: tuple[PilotTrainingEvent, ...],
@@ -313,12 +344,16 @@ def _result_payload(
 ) -> dict:
     return {
         "block_index": int(block_index),
+        "selection_split": _SELECTION_SPLIT,
         "replay_reports": [asdict(row) for row in replay_reports],
         "initialization_evaluations": [asdict(row) for row in evaluations],
         "selected_route_mode": selected.route_mode,
         "selected_lambda_relative": selected.lambda_relative,
-        "identity_baseline": asdict(identity.metrics),
-        "least_squares_baseline": asdict(best_ls.metrics),
+        "identity_baseline": asdict(identity_baseline),
+        "least_squares_baseline": asdict(least_squares_baseline),
+        "least_squares_baseline_lambda_relative": float(
+            least_squares_baseline_lambda_relative
+        ),
         "candidate": asdict(candidate),
         "candidate_attention_diagnostics": [
             asdict(row) for row in candidate_attention_diagnostics
@@ -380,17 +415,41 @@ def run_stage_a_block_pilot(
     train_cases = _move_cases(train_records, device)
     holdout_cases = _move_cases(holdout_records, device)
 
+    # Initialization/model-selection decisions are training-data decisions.  The fixed
+    # complete-case holdout remains untouched until the two untrained baselines and the
+    # trained candidate are evaluated for the Stage-A exit gate.
     evaluations, selected, best_ls = _evaluate_initialization_grid(
         teacher_block,
-        holdout_cases,
-        holdout_records,
+        train_cases,
+        train_records,
         block_index=block_index,
         device=device,
         weights=loss_weights,
         route_fits=route_fits,
         student_builder=student_builder,
     )
-    identity = next(row for row in evaluations if row.route_mode == "identity")
+    identity_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="identity",
+        lambda_relative=0.0,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    least_squares_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="least_squares",
+        lambda_relative=best_ls.lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
 
     student = _build_student(
         teacher_block,
@@ -431,8 +490,8 @@ def run_stage_a_block_pilot(
     gate = evaluate_stage_a_block_gate(
         block_index=block_index,
         candidate=candidate,
-        identity_baseline=identity.metrics,
-        least_squares_baseline=best_ls.metrics,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
         training_events=event_tuple,
         policy=policy,
     )
@@ -459,8 +518,9 @@ def run_stage_a_block_pilot(
                 replay_reports=replay_reports,
                 evaluations=evaluations,
                 selected=selected,
-                identity=identity,
-                best_ls=best_ls,
+                identity_baseline=identity_baseline,
+                least_squares_baseline=least_squares_baseline,
+                least_squares_baseline_lambda_relative=best_ls.lambda_relative,
                 candidate=candidate,
                 candidate_attention_diagnostics=candidate_attention_diagnostics,
                 events=event_tuple,
@@ -473,8 +533,9 @@ def run_stage_a_block_pilot(
         initialization_evaluations=evaluations,
         selected_route_mode=selected.route_mode,
         selected_lambda_relative=selected.lambda_relative,
-        identity_baseline=identity.metrics,
-        least_squares_baseline=best_ls.metrics,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
+        least_squares_baseline_lambda_relative=best_ls.lambda_relative,
         candidate=candidate,
         candidate_attention_diagnostics=candidate_attention_diagnostics,
         training_events=event_tuple,

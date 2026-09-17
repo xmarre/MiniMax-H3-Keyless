@@ -19,7 +19,7 @@ from .pilot_campaign import (
 )
 
 
-STAGE_A_RESULT_SCHEMA = "minimax_h3_keyless_stage_a_block_result_v2"
+STAGE_A_RESULT_SCHEMA = "minimax_h3_keyless_stage_a_block_result_v3"
 _SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
