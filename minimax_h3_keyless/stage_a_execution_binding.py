@@ -114,14 +114,17 @@ def _collect_prompt_strings(value: Any, out: set[str]) -> None:
 
 def _collect_linked_node_ids(value: Any, known_ids: set[str], out: set[str]) -> None:
     if isinstance(value, (tuple, list)):
+        # Comfy API links are ["node-id", output_index]. Requiring a string node id avoids
+        # misclassifying ordinary two-number arrays such as [512, 512] as graph edges merely
+        # because a node happens to have the same numeric-looking id.
         if (
             len(value) == 2
-            and not isinstance(value[0], (dict, list, tuple))
-            and str(value[0]) in known_ids
+            and isinstance(value[0], str)
+            and value[0] in known_ids
             and isinstance(value[1], int)
             and not isinstance(value[1], bool)
         ):
-            out.add(str(value[0]))
+            out.add(value[0])
             return
         for item in value:
             _collect_linked_node_ids(item, known_ids, out)
@@ -172,10 +175,10 @@ def validate_stage_a_manifest_assets_for_workflow(
     """Bind manifest asset identities to file literals on the capture-connected graph.
 
     Canonical Stage-A evidence is intentionally file-backed. Every declared ``path_or_uri``
-    must occur on the same statically connected Comfy API graph as the Stage-A capture node,
-    and the path resolved by Comfy must hash to the manifest SHA-256. A disconnected/dead
-    loader node is not enough. Remote/dynamic assets without a locally resolvable immutable
-    file are rejected instead of being operator-attested.
+    must occur in an input value on the same statically connected Comfy API graph as the
+    Stage-A capture node, and the path resolved by Comfy must hash to the manifest SHA-256.
+    A disconnected/dead loader node is not enough. Remote/dynamic assets without a locally
+    resolvable immutable file are rejected instead of being operator-attested.
     """
     assets = case.get("assets", [])
     if not isinstance(assets, list):
@@ -190,8 +193,8 @@ def validate_stage_a_manifest_assets_for_workflow(
     connected = _capture_connected_node_ids(prompt, capture_node_id=capture_node_id)
     prompt_strings: set[str] = set()
     for raw_id, node in prompt.items():
-        if str(raw_id) in connected:
-            _collect_prompt_strings(node, prompt_strings)
+        if str(raw_id) in connected and isinstance(node, Mapping):
+            _collect_prompt_strings(node.get("inputs", {}), prompt_strings)
     case_id = str(case.get("case_id", "<unknown>"))
     for index, asset in enumerate(assets):
         if not isinstance(asset, Mapping):
