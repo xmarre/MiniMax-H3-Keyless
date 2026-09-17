@@ -28,6 +28,7 @@ if __package__:
         prepare_progressive_overlay,
         require_progressive_overlay,
     )
+    from .minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
     from .minimax_h3_keyless.teacher import load_pinned_bf16_teacher
 else:
     from minimax_h3_keyless.capture_io import CaptureBundleProvenance
@@ -53,6 +54,7 @@ else:
         prepare_progressive_overlay,
         require_progressive_overlay,
     )
+    from minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
     from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
 
 
@@ -114,6 +116,76 @@ class MiniMaxH3StageATeacherLoader:
         path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
         loaded = load_pinned_bf16_teacher(path)
         mark_pinned_stage_a_teacher(loaded.patcher)
+        return (loaded.patcher,)
+
+
+class MiniMaxH3ProgressiveSnapshotLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+
+        return {
+            "required": {
+                "teacher_model_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "snapshot_path": ("STRING", {"default": "", "multiline": False}),
+                "snapshot_manifest_path": ("STRING", {"default": "", "multiline": False}),
+                "prefix_manifest_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "loaders/advanced"
+    DESCRIPTION = (
+        "Phase-4 loader for an immutable h3_keyless_progressive_core50_v1 folded BF16 "
+        "snapshot. It reconstructs the exact accepted QV/native-QKV prefix into a fresh "
+        "pinned BF16 teacher using bounded tensor-at-a-time safetensors reads. The snapshot "
+        "is non-canonical and intended for periodic full-denoiser/media checks; successful "
+        "loading alone is not a parity result."
+    )
+
+    def load(
+        self,
+        teacher_model_name: str,
+        snapshot_path: str,
+        snapshot_manifest_path: str,
+        prefix_manifest_path: str,
+    ):
+        import folder_paths
+
+        snapshot_path = snapshot_path.strip()
+        snapshot_manifest_path = snapshot_manifest_path.strip()
+        prefix_manifest_path = prefix_manifest_path.strip()
+        if not snapshot_path or not snapshot_manifest_path or not prefix_manifest_path:
+            raise ValueError(
+                "progressive snapshot, snapshot manifest and prefix manifest paths must be non-empty"
+            )
+
+        prefix, prefix_manifest_sha256 = load_progressive_prefix_manifest(prefix_manifest_path)
+        plugin_commit = discover_clean_git_revision(
+            Path(__file__).resolve().parent,
+            label="MiniMax-H3-Keyless",
+        )
+        if plugin_commit.lower() != prefix.code_commit.lower():
+            raise RuntimeError(
+                "progressive snapshot loader source revision differs from the sweep revision: "
+                f"runtime={plugin_commit}, prefix={prefix.code_commit}"
+            )
+
+        teacher_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models",
+            teacher_model_name,
+        )
+        loaded = load_pinned_bf16_teacher(teacher_path)
+        diffusion_model = loaded.diffusion_model
+        diffusion_model.to(torch.device("cpu"))
+        load_progressive_snapshot_streaming(
+            diffusion_model,
+            snapshot_path,
+            prefix,
+            prefix_manifest_sha256=prefix_manifest_sha256,
+            manifest_path=snapshot_manifest_path,
+        )
         return (loaded.patcher,)
 
 
@@ -347,6 +419,7 @@ class MiniMaxH3ProgressiveCapture:
 NODE_CLASS_MAPPINGS = {
     "MiniMaxH3KeylessLoader": MiniMaxH3KeylessLoader,
     "MiniMaxH3StageATeacherLoader": MiniMaxH3StageATeacherLoader,
+    "MiniMaxH3ProgressiveSnapshotLoader": MiniMaxH3ProgressiveSnapshotLoader,
     "MiniMaxH3StageACapture": MiniMaxH3StageACapture,
     "MiniMaxH3ProgressiveOverlay": MiniMaxH3ProgressiveOverlay,
     "MiniMaxH3ProgressiveCapture": MiniMaxH3ProgressiveCapture,
@@ -354,6 +427,7 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3KeylessLoader": "MiniMax H3 Keyless Loader",
     "MiniMaxH3StageATeacherLoader": "MiniMax H3 Stage-A BF16 Teacher Loader",
+    "MiniMaxH3ProgressiveSnapshotLoader": "MiniMax H3 Progressive Snapshot Loader",
     "MiniMaxH3StageACapture": "MiniMax H3 Stage-A Capture",
     "MiniMaxH3ProgressiveOverlay": "MiniMax H3 Progressive Prefix Overlay",
     "MiniMaxH3ProgressiveCapture": "MiniMax H3 Progressive Capture",
