@@ -186,6 +186,10 @@ class MiniMaxH3ProgressiveSnapshotLoader:
             prefix_manifest_sha256=prefix_manifest_sha256,
             manifest_path=snapshot_manifest_path,
         )
+        # Comfy's ModelPatcher caches module_size after the first query. The mixed snapshot
+        # has smaller accepted QV projections than its native-QKV constructor teacher, so
+        # force the next scheduler query to measure the post-reconstruction topology.
+        loaded.patcher.size = 0
         return (loaded.patcher,)
 
 
