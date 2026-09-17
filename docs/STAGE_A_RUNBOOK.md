@@ -15,7 +15,20 @@ The production Stage-A dataset validator requires at least 16 cases, at least 8 
 
 Train/holdout isolation is by complete case **and asset content**. Case IDs must be unique. An asset SHA-256 may be reused by multiple cases inside the same split, but the same asset bytes may not appear in both `train` and `holdout`, even under different paths or URIs. This prevents reference/audio/video assets from leaking across the empirical gate under renamed case IDs.
 
-Do not change dataset, gate, or train-plan inputs after seeing pilot outcomes and continue under the same run identity. Use a new experiment/run identity instead.
+Canonical live Stage-A capture additionally requires each case to predeclare `workflow_prompt_sha256`. This is the SHA-256 of the exact Comfy API-format prompt graph that will execute that case, after only UI `_meta` fields and the Stage-A capture node's bookkeeping inputs (`dataset_manifest_path`, `case_id`, `target_sigma`, `output_subdir`, `max_capture_mib`, `sigma_tolerance`) are normalized. The remaining graph is intentionally over-bound: prompt text, loader filenames, seeds, sampler/scheduler settings, geometry and all other API prompt values remain part of the identity.
+
+Export the workflow in **API prompt format**, then compute the case identity before capture:
+
+```bash
+python tools/hash_stage_a_workflow_prompt.py /path/to/case.api.json \
+  --capture-node-id <MiniMaxH3StageACapture-node-id>
+```
+
+If the API prompt contains exactly one `MiniMaxH3StageACapture`, `--capture-node-id` may be omitted. Store the printed digest as that manifest case's `workflow_prompt_sha256`. Capture destinations and observed sigma strata may then change through the normalized Stage-A bookkeeping fields without changing the semantic workflow identity.
+
+Every manifest asset used for canonical Stage A must be file-backed and named by the same `path_or_uri` literal that appears in the executed API prompt. At node execution, Comfy resolves that literal with its normal annotated-file path resolver and MiniMax-H3-Keyless hashes the resolved bytes. The resulting SHA-256 must equal the manifest asset hash. Remote/dynamic assets that cannot be resolved to an immutable local file are not accepted as canonical Stage-A evidence; materialize them first and record the resulting file/hash in the fixed manifest.
+
+Do not change dataset, workflow graph, assets, gate, or train-plan inputs after seeing pilot outcomes and continue under the same run identity. Use a new experiment/run identity instead.
 
 ## 2. Capture under plain native H3
 
@@ -29,9 +42,11 @@ Route its `MODEL` output through **MiniMax H3 Stage-A Capture** before the norma
 - `output_subdir`: a relative path below the Comfy output directory;
 - `max_capture_mib`: an explicit per-forward CPU capture budget.
 
-Run the real workflow for that exact manifest case. The workflow itself is responsible for reproducing the manifest prompt, seed, schedule, media/reference inputs, duration and resolution. The capture node does not synthesize those inputs from the manifest.
+The node receives Comfy's hidden `PROMPT` and `UNIQUE_ID` execution inputs. Before it installs any capture wrapper it canonicalizes the **executed** API prompt, compares its hash with the case's fixed `workflow_prompt_sha256`, verifies every declared asset literal against the resolved file bytes, and fails closed on any mismatch. A valid case ID by itself is not sufficient evidence that the requested prompt/seed/assets/geometry were actually executed.
 
-At the target video sigma, the capture wrapper records the live inputs required to replay blocks 0, 25 and 49. It records the block input, actual post-AdaLN attention input, timestep embedding/modulation state, RoPE/layout state and audit context. Capture tensors are copied to CPU and bounded by `max_capture_mib`.
+The workflow still owns the generation inputs; the capture node does not synthesize prompt, seed, schedule, media/reference inputs, duration or resolution from the manifest. Instead, the workflow hash binds the complete API graph representing those choices, while live capture separately binds the observed H3 sigma and the actual block/attention inputs produced by that execution.
+
+At the target video sigma, the capture wrapper records the live inputs required to replay blocks 0, 25 and 49. It records the block input, actual post-AdaLN attention input, timestep embedding/modulation state, RoPE/layout state, the canonical workflow-prompt SHA-256 and audit context. Capture tensors are copied to CPU and bounded by `max_capture_mib`.
 
 ### Fail-closed capture conditions
 
@@ -39,6 +54,8 @@ A Stage-A capture is rejected rather than silently accepted when any of the foll
 
 - the model did not originate from the strict Stage-A BF16 teacher loader;
 - the live native H3 topology no longer matches the pinned teacher contract;
+- the executed Comfy API prompt does not match the case's predeclared `workflow_prompt_sha256`;
+- a declared asset is absent from the API prompt, cannot be resolved as a local Comfy file, or its bytes do not match the manifest SHA-256;
 - model patches, object patches, weight wrappers, injections, hooks or callbacks are active;
 - another `DIFFUSION_MODEL` wrapper is installed;
 - a Keyless provider or optimized-attention override is active;
@@ -49,11 +66,13 @@ A Stage-A capture is rejected rather than silently accepted when any of the foll
 
 Spectrum, SOL, VDN, Flow and other execution-changing integrations are compatibility distributions for later validation. They are not the Stage-A native-teacher definition.
 
+The workflow binding uses Comfy's original API prompt delivered through hidden `PROMPT`. Dynamic/ephemeral graph expansion is therefore not treated as independently attested canonical Stage-A structure. Keep the canonical Stage-A workflow static and explicit; if a workflow depends on runtime graph generation, materialize an equivalent fixed API graph before using it as release evidence.
+
 ### Source provenance
 
 Live capture requires clean Git working trees for both MiniMax-H3-Keyless and ComfyUI. Their full commit IDs are written into the capture provenance. A dirty tracked working tree is rejected.
 
-All captures used in one registry must have the same teacher identity, MiniMax-H3-Keyless capture commit, ComfyUI commit and execution descriptor.
+All captures used in one registry must have the same teacher identity, MiniMax-H3-Keyless capture commit, ComfyUI commit and execution descriptor. Per-case workflow identities are stored in the capture record context and validated independently against the fixed dataset manifest; they are not folded into the common execution descriptor because different cases legitimately use different generation graphs.
 
 ## 3. Capture every manifest case/sigma execution
 
@@ -74,7 +93,7 @@ python tools/build_stage_a_capture_registry.py \
   --output /path/to/stage_a_capture_registry.json
 ```
 
-The builder recursively finds `*.capture.pt.receipt.json` by default. It hash-checks every receipt and bundle, validates serialized capture records one artifact at a time, checks exact block/case/sigma/modality provenance, rejects mixed source provenance, and requires exact coverage of the manifest case×sigma corpus. It does not retain the complete activation corpus in memory while building the registry.
+The builder recursively finds `*.capture.pt.receipt.json` by default. It hash-checks every receipt and bundle, validates serialized capture records one artifact at a time, checks exact block/case/sigma/modality provenance, recomputes the expected per-case workflow binding from the fixed manifest, rejects mixed source provenance, and requires exact coverage of the manifest case×sigma corpus. It does not retain the complete activation corpus in memory while building the registry.
 
 The emitted registry stores relative bundle/receipt paths plus each immutable receipt SHA-256. Moving the registry together with its capture tree preserves those relative references.
 
@@ -97,7 +116,7 @@ python tools/run_stage_a_pilots.py \
 
 The runner requires the claimed `--code-commit` to equal the clean MiniMax-H3-Keyless source actually executing the campaign. It also requires the current clean ComfyUI revision to equal the ComfyUI revision that produced the capture corpus.
 
-The runner indexes and hash-validates the full capture corpus without loading all activation tensors. For each pilot depth it materializes only that block's train/holdout records, then releases them when the block run ends. This avoids keeping captures for blocks 0, 25 and 49 resident simultaneously.
+The runner indexes and hash-validates the full capture corpus without loading all activation tensors. For each pilot depth it materializes only that block's train/holdout records, then releases them when the block run ends. On each materialization it independently rechecks the captured workflow SHA against the fixed manifest before the records reach training. This avoids trusting registry publication as the only workflow-identity check and catches later artifact substitution through the existing receipt/bundle hashes plus the per-record semantic binding.
 
 For each block, the Stage-A v3 runner:
 
