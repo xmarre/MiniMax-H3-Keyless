@@ -106,19 +106,23 @@ class StageACampaignPilotResult:
 def validate_stage_a_train_plan(plan: Sequence[StageATrainStage]) -> tuple[StageATrainStage, ...]:
     if not plan:
         raise ValueError("Stage-A training plan must contain at least the route stage")
-    ranks = {"route": 0, "query": 1, "value": 2, "norm_out": 3}
+    ranks = {"route": 0, "query": 1, "value": 2}
     if plan[0].stage != "route":
         raise ValueError("Stage-A training plan must start with route calibration")
     seen: set[str] = set()
     previous = -1
     for spec in plan:
+        if spec.stage == "norm_out":
+            raise ValueError(
+                "canonical Stage-A v3 does not authorize norm_out in the fixed train plan; "
+                "q_norm/out_proj escalation requires a separately predeclared train-only "
+                "calibration decision after value-stage plateau and must not use the exit holdout"
+            )
         if spec.stage in seen:
             raise ValueError(f"Stage-A training plan repeats stage {spec.stage!r}")
         rank = ranks[spec.stage]
         if rank <= previous:
-            raise ValueError("Stage-A training stages must follow route→query→value→norm_out order")
-        if spec.stage == "norm_out" and "value" not in seen:
-            raise ValueError("Stage-A norm/out escalation requires value to be unfrozen first")
+            raise ValueError("Stage-A training stages must follow route→query→value order")
         seen.add(spec.stage)
         previous = rank
     return tuple(plan)
