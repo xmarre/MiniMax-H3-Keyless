@@ -23,11 +23,18 @@ class StageACampaignEvidence:
     sha256: str
     run_id: str
     code_commit: str
+    training_comfy_commit: str
     final_stage: str
     experiment_context_sha256: str
     teacher_sha256: str
     dataset_manifest_sha256: str
     gate_manifest_sha256: str
+    capture_registry_file_sha256: str
+    train_plan_identity_sha256: str
+    train_plan_file_sha256: str
+    capture_code_commit: str
+    capture_comfy_commit: str
+    capture_execution_descriptor: str
     block_evidence: Mapping[int, CompletedStageABlockEvidence]
     gate: StageACampaignGateResult
 
@@ -104,7 +111,8 @@ def load_stage_a_campaign_evidence(
     which verifies its checkpoint/result hashes, experiment identity, initialization grid,
     attention diagnostics and recomputed block gate. The campaign gate is then recomputed
     from those three block gates. A JSON field claiming ``passed=true`` is never trusted
-    on its own.
+    on its own. Fixed train-plan and capture/runtime provenance is retained in the returned
+    evidence so Stage-B orchestration can require the exact pilot-authorized recipe.
     """
     path = Path(path)
     try:
@@ -142,10 +150,16 @@ def load_stage_a_campaign_evidence(
 
     run_id = _nonempty_string(top["run_id"], "Stage-A campaign run_id")
     code_commit = _nonempty_string(top["code_commit"], "Stage-A campaign code_commit").lower()
-    _nonempty_string(top["training_comfy_commit"], "Stage-A campaign training_comfy_commit")
-    _nonempty_string(top["capture_code_commit"], "Stage-A campaign capture_code_commit")
-    _nonempty_string(top["capture_comfy_commit"], "Stage-A campaign capture_comfy_commit")
-    _nonempty_string(
+    training_comfy_commit = _nonempty_string(
+        top["training_comfy_commit"], "Stage-A campaign training_comfy_commit"
+    )
+    capture_code_commit = _nonempty_string(
+        top["capture_code_commit"], "Stage-A campaign capture_code_commit"
+    )
+    capture_comfy_commit = _nonempty_string(
+        top["capture_comfy_commit"], "Stage-A campaign capture_comfy_commit"
+    )
+    capture_execution_descriptor = _nonempty_string(
         top["capture_execution_descriptor"], "Stage-A campaign capture_execution_descriptor"
     )
     final_stage = _nonempty_string(top["final_stage"], "Stage-A campaign final_stage")
@@ -233,11 +247,18 @@ def load_stage_a_campaign_evidence(
         sha256=sha256_file(path),
         run_id=run_id,
         code_commit=code_commit,
+        training_comfy_commit=training_comfy_commit,
         final_stage=final_stage,
         experiment_context_sha256=shas["experiment_context_sha256"],
         teacher_sha256=shas["teacher_sha256"],
         dataset_manifest_sha256=shas["dataset_manifest_sha256"],
         gate_manifest_sha256=shas["gate_manifest_sha256"],
+        capture_registry_file_sha256=shas["capture_registry_file_sha256"],
+        train_plan_identity_sha256=shas["train_plan_identity_sha256"],
+        train_plan_file_sha256=shas["train_plan_file_sha256"],
+        capture_code_commit=capture_code_commit,
+        capture_comfy_commit=capture_comfy_commit,
+        capture_execution_descriptor=capture_execution_descriptor,
         block_evidence=completed,
         gate=recomputed_gate,
     )
