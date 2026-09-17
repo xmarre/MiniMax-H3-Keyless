@@ -12,6 +12,7 @@ from minimax_h3_keyless.checkpoint import sha256_file
 from minimax_h3_keyless.contracts import TEACHER_COMPATIBILITY_MARKER
 from minimax_h3_keyless.export import (
     build_export_manifest_body,
+    export_deploy_bf16,
     export_folded_bf16,
     manifest_identity_sha256,
 )
@@ -61,6 +62,90 @@ def test_export_receipt_binds_metadata_manifest_and_artifact_sha(tmp_path: Path,
     assert receipt["artifact_bytes"] == result.artifact_bytes
     assert receipt["manifest_sha256"] == result.manifest_identity_sha256
     assert result.manifest_sha256 == sha256_file(result.manifest_path)
+
+
+def test_direct_deploy_export_does_not_refold_already_folded_state(tmp_path: Path, monkeypatch) -> None:
+    deploy = {
+        "weight": torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16),
+        "bias": torch.tensor([1.0, 2.0], dtype=torch.float32),
+    }
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
+    monkeypatch.setattr(
+        export_mod,
+        "fold_training_state_dict",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("already-folded deploy state must never be folded again")
+        ),
+    )
+    path = tmp_path / "deploy.safetensors"
+    result = export_deploy_bf16(
+        deploy,
+        path,
+        metadata={"training_run": "progressive", "export_commit": "deadbeef"},
+    )
+    assert result.tensor_count == len(deploy)
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        assert set(f.keys()) == set(deploy)
+        for key, expected in deploy.items():
+            torch.testing.assert_close(f.get_tensor(key), expected)
+
+
+def test_immutable_deploy_export_refuses_existing_pair_without_replacing_bytes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    deploy = {"weight": torch.ones(2, 2, dtype=torch.bfloat16)}
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
+    path = tmp_path / "immutable.safetensors"
+    first = export_deploy_bf16(
+        deploy,
+        path,
+        metadata={"training_run": "progressive", "export_commit": "deadbeef"},
+        refuse_replace=True,
+    )
+    artifact_sha = sha256_file(first.artifact_path)
+    manifest_sha = sha256_file(first.manifest_path)
+
+    with pytest.raises(FileExistsError, match="immutable export outputs already exist"):
+        export_deploy_bf16(
+            {"weight": torch.zeros(2, 2, dtype=torch.bfloat16)},
+            path,
+            metadata={"training_run": "other", "export_commit": "different"},
+            refuse_replace=True,
+        )
+    assert sha256_file(first.artifact_path) == artifact_sha
+    assert sha256_file(first.manifest_path) == manifest_sha
+
+
+def test_immutable_deploy_export_rolls_back_artifact_when_receipt_publish_fails(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    deploy = {"weight": torch.ones(2, 2, dtype=torch.bfloat16)}
+    monkeypatch.setattr(export_mod, "validate_deploy_checkpoint", lambda tensors, metadata: None)
+    output = tmp_path / "rollback.safetensors"
+    manifest = tmp_path / "rollback.receipt.json"
+    real_publish = export_mod._publish_no_replace
+    calls = 0
+
+    def fail_second_publish(source: Path, destination: Path) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise FileExistsError("simulated receipt publication collision")
+        real_publish(source, destination)
+
+    monkeypatch.setattr(export_mod, "_publish_no_replace", fail_second_publish)
+    with pytest.raises(FileExistsError, match="simulated receipt"):
+        export_deploy_bf16(
+            deploy,
+            output,
+            manifest_path=manifest,
+            metadata={"training_run": "progressive", "export_commit": "deadbeef"},
+            refuse_replace=True,
+        )
+    assert not output.exists()
+    assert not manifest.exists()
 
 
 def test_export_records_teacher_compatibility_in_hashed_manifest(tmp_path: Path, monkeypatch) -> None:
