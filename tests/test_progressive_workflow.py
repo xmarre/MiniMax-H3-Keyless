@@ -15,7 +15,10 @@ from minimax_h3_keyless.progressive_authorization import (
     load_progressive_prefix_manifest,
     write_progressive_prefix_manifest,
 )
-from minimax_h3_keyless.progressive_workflow import persist_accept_progressive_block
+from minimax_h3_keyless.progressive_workflow import (
+    accept_persisted_progressive_block,
+    persist_accept_progressive_block,
+)
 
 
 class NativeAttention(nn.Module):
@@ -133,6 +136,33 @@ def test_progressive_step_persists_accepts_then_hash_chains_prefix_manifest(tmp_
     assert loaded == outcome.prefix
     assert loaded_sha == outcome.prefix_manifest_sha256
     validate_progressive_model_prefix(model, outcome.prefix)
+
+
+def test_persisted_progressive_step_accepts_without_writing_candidate_twice(tmp_path: Path, monkeypatch) -> None:
+    model = Core50()
+    prefix = _prefix()
+    current = tmp_path / "workflow.prefix-00.json"
+    current_sha = write_progressive_prefix_manifest(current, prefix, previous_manifest_sha256=None)
+    artifact = _artifact(tmp_path)
+    calls = _install_fakes(monkeypatch, model, prefix, artifact)
+
+    outcome = accept_persisted_progressive_block(
+        model,
+        prefix,
+        SimpleNamespace(),
+        SimpleNamespace(block_index=0),
+        artifact,
+        current_prefix_manifest_path=current,
+        current_prefix_manifest_sha256=current_sha,
+        output_dir=tmp_path,
+        gate_manifest={},
+        fold_atol=0.0,
+        fold_rtol=0.0,
+    )
+
+    assert calls == ["validate-captures", "accept"]
+    assert outcome.artifact is artifact
+    assert outcome.prefix.accepted_blocks == (0,)
 
 
 def test_progressive_step_rolls_live_model_back_if_prefix_publish_fails(tmp_path: Path, monkeypatch) -> None:
