@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -155,8 +157,114 @@ def manifest_identity_sha256(body: Mapping[str, Any]) -> str:
     return hashlib.sha256(_canonical_json_bytes(body)).hexdigest()
 
 
-def export_folded_bf16(
-    state_dict: Mapping[str, torch.Tensor],
+def _temporary_path(destination: Path) -> Path:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        dir=destination.parent,
+    )
+    os.close(fd)
+    return Path(name)
+
+
+def _publish_no_replace(source: Path, destination: Path) -> None:
+    try:
+        os.link(source, destination)
+    except FileExistsError as exc:
+        raise FileExistsError(f"immutable export output already exists: {destination}") from exc
+
+
+def _unlink_if_same(path: Path, source: Path) -> None:
+    try:
+        if path.exists() and source.exists() and os.path.samefile(path, source):
+            path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _unlink(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _write_export_transaction(
+    tensors: Mapping[str, torch.Tensor],
+    output_path: Path,
+    manifest_path: Path,
+    *,
+    metadata: Mapping[str, str],
+    receipt: Mapping[str, Any],
+    refuse_replace: bool,
+) -> tuple[str, int, str]:
+    cpu = {k: v.detach().cpu().contiguous() for k, v in tensors.items()}
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not refuse_replace:
+        save_file(cpu, str(output_path), metadata=dict(metadata))
+        artifact_sha = sha256_file(output_path)
+        artifact_bytes = output_path.stat().st_size
+        final_receipt = dict(receipt)
+        final_receipt["artifact_sha256"] = artifact_sha
+        final_receipt["artifact_bytes"] = artifact_bytes
+        manifest_path.write_text(
+            json.dumps(final_receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        return artifact_sha, artifact_bytes, sha256_file(manifest_path)
+
+    occupied = [str(path) for path in (output_path, manifest_path) if path.exists()]
+    if occupied:
+        raise FileExistsError(f"immutable export outputs already exist: {occupied}")
+
+    artifact_temp: Path | None = None
+    manifest_temp: Path | None = None
+    artifact_published = False
+    manifest_published = False
+    try:
+        artifact_temp = _temporary_path(output_path)
+        save_file(cpu, str(artifact_temp), metadata=dict(metadata))
+        with artifact_temp.open("rb") as handle:
+            os.fsync(handle.fileno())
+        artifact_sha = sha256_file(artifact_temp)
+        artifact_bytes = artifact_temp.stat().st_size
+
+        final_receipt = dict(receipt)
+        final_receipt["artifact_sha256"] = artifact_sha
+        final_receipt["artifact_bytes"] = artifact_bytes
+        manifest_temp = _temporary_path(manifest_path)
+        encoded = (
+            json.dumps(final_receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        with manifest_temp.open("wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        manifest_sha = sha256_file(manifest_temp)
+
+        _publish_no_replace(artifact_temp, output_path)
+        artifact_published = True
+        _publish_no_replace(manifest_temp, manifest_path)
+        manifest_published = True
+        return artifact_sha, artifact_bytes, manifest_sha
+    except BaseException:
+        if manifest_published and manifest_temp is not None:
+            _unlink_if_same(manifest_path, manifest_temp)
+        if artifact_published and artifact_temp is not None:
+            _unlink_if_same(output_path, artifact_temp)
+        raise
+    finally:
+        _unlink(manifest_temp)
+        _unlink(artifact_temp)
+
+
+def export_deploy_bf16(
+    deploy_state_dict: Mapping[str, torch.Tensor],
     output_path: str | Path,
     *,
     metadata: Mapping[str, str],
@@ -164,28 +272,35 @@ def export_folded_bf16(
     command: str | None = None,
     manifest_extra: Mapping[str, Any] | None = None,
     teacher_path: str | Path | None = None,
+    refuse_replace: bool = False,
 ) -> ExportResult:
-    """Write folded BF16 plus a deterministic provenance/tensor receipt.
+    """Write an already-folded canonical BF16 deploy mapping plus deterministic receipt.
 
-    Passing ``teacher_path`` enables the canonical full-compatibility gate: every key and
-    signature must be the exact native-QKV -> Keyless-QV transformation, and every tensor
-    outside the design-authorized core-attention trainable set must remain byte-identical
-    to the pinned BF16 teacher. Release exports must use this gate.
+    This is the canonical writer for both direct deploy state and q/R/v training exports.
+    Passing ``teacher_path`` enables the full pinned-teacher compatibility gate: every key
+    and signature must be the exact native-QKV -> Keyless-QV transformation, and every
+    tensor outside the design-authorized core-attention trainable set must remain
+    byte-identical to the teacher. Release exports must use this gate.
 
-    The sidecar has two layers to avoid a hash cycle: the deterministic manifest body
-    is hashed first and that identity is embedded as ``manifest_sha256`` in the
-    safetensors metadata. After the artifact is written, the sidecar receipt adds the
-    artifact full-file SHA-256 and byte size. The final sidecar file hash is returned
-    separately and is not embedded back into the artifact.
+    ``refuse_replace=True`` publishes the artifact and receipt through same-directory hard
+    links and rolls the artifact back if receipt publication fails. This is intended for
+    immutable accepted release artifacts; the default preserves the historical overwrite
+    behavior of ``export_folded_bf16`` for existing callers.
     """
     output_path = Path(output_path)
+    if manifest_path is None:
+        manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
+    manifest_path = Path(manifest_path)
+    if output_path == manifest_path:
+        raise ValueError("export artifact and manifest paths must be different")
     if "teacher_compatibility" in metadata:
         raise ValueError(
             "metadata may not set reserved teacher_compatibility evidence; pass teacher_path"
         )
-    folded = fold_training_state_dict(state_dict, output_dtype=torch.bfloat16)
+
+    deploy = dict(deploy_state_dict)
     base_metadata = {k: str(v) for k, v in metadata.items() if k != "manifest_sha256"}
-    validate_deploy_checkpoint(folded, base_metadata)
+    validate_deploy_checkpoint(deploy, base_metadata)
 
     body_extra = dict(manifest_extra or {})
     if "teacher_compatibility" in body_extra:
@@ -194,7 +309,7 @@ def export_folded_bf16(
     if teacher_path is not None:
         from .teacher_compat import validate_deploy_mapping_against_teacher
 
-        report = validate_deploy_mapping_against_teacher(teacher_path, folded)
+        report = validate_deploy_mapping_against_teacher(teacher_path, deploy)
         if base_metadata.get("parent_model_sha256", "").lower() != report.teacher_sha256.lower():
             raise ValueError(
                 "export metadata parent_model_sha256 does not match the teacher used by the compatibility gate"
@@ -210,7 +325,7 @@ def export_folded_bf16(
         }
 
     body = build_export_manifest_body(
-        folded,
+        deploy,
         artifact_filename=output_path.name,
         metadata=base_metadata,
         command=command,
@@ -224,25 +339,18 @@ def export_folded_bf16(
         )
     final_metadata = dict(base_metadata)
     final_metadata["manifest_sha256"] = identity
-    validate_deploy_checkpoint(folded, final_metadata)
-
-    cpu = {k: v.detach().cpu().contiguous() for k, v in folded.items()}
-    save_file(cpu, str(output_path), metadata=final_metadata)
-    artifact_sha = sha256_file(output_path)
-    artifact_bytes = output_path.stat().st_size
+    validate_deploy_checkpoint(deploy, final_metadata)
 
     receipt = dict(body)
     receipt["manifest_sha256"] = identity
-    receipt["artifact_sha256"] = artifact_sha
-    receipt["artifact_bytes"] = artifact_bytes
-    if manifest_path is None:
-        manifest_path = output_path.with_suffix(output_path.suffix + ".manifest.json")
-    manifest_path = Path(manifest_path)
-    manifest_path.write_text(
-        json.dumps(receipt, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
+    artifact_sha, artifact_bytes, sidecar_sha = _write_export_transaction(
+        deploy,
+        output_path,
+        manifest_path,
+        metadata=final_metadata,
+        receipt=receipt,
+        refuse_replace=bool(refuse_replace),
     )
-    sidecar_sha = sha256_file(manifest_path)
     return ExportResult(
         artifact_path=str(output_path),
         artifact_sha256=artifact_sha,
@@ -250,6 +358,36 @@ def export_folded_bf16(
         manifest_path=str(manifest_path),
         manifest_sha256=sidecar_sha,
         manifest_identity_sha256=identity,
-        tensor_count=len(folded),
+        tensor_count=len(deploy),
         teacher_compatibility_checked=compatibility_checked,
+    )
+
+
+def export_folded_bf16(
+    state_dict: Mapping[str, torch.Tensor],
+    output_path: str | Path,
+    *,
+    metadata: Mapping[str, str],
+    manifest_path: str | Path | None = None,
+    command: str | None = None,
+    manifest_extra: Mapping[str, Any] | None = None,
+    teacher_path: str | Path | None = None,
+    refuse_replace: bool = False,
+) -> ExportResult:
+    """Fold an all-core q/R/v training mapping once in FP32 and write canonical BF16.
+
+    The q/R/v representation is converted to deploy QV and delegated to
+    ``export_deploy_bf16`` so direct progressive-prefix export and legacy aggregate training
+    export share exactly the same validation, provenance and teacher-compatibility path.
+    """
+    folded = fold_training_state_dict(state_dict, output_dtype=torch.bfloat16)
+    return export_deploy_bf16(
+        folded,
+        output_path,
+        metadata=metadata,
+        manifest_path=manifest_path,
+        command=command,
+        manifest_extra=manifest_extra,
+        teacher_path=teacher_path,
+        refuse_replace=refuse_replace,
     )
