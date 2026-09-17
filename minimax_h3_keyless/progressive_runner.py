@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
 from itertools import chain
+from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
 import torch
@@ -10,7 +11,12 @@ import torch.nn as nn
 
 from .attention import KeylessAttentionTrain
 from .initialization import RouteInitMode
-from .pilot import PilotLossWeights, build_training_student_block, set_pilot_block_stage
+from .pilot import (
+    PilotLossWeights,
+    build_training_student_block,
+    pilot_train_step,
+    set_pilot_block_stage,
+)
 from .pilot_attention_diagnostics import (
     PilotAttentionDiagnostic,
     compare_captured_native_keyless_attention,
@@ -20,7 +26,6 @@ from .pilot_campaign import (
     PilotAggregateMetrics,
     PilotTrainingEvent,
     evaluate_pilot_cases,
-    train_pilot_stage,
     validate_pilot_gate_manifest,
 )
 from .pilot_gates import StageAGatePolicy, stage_a_policy_from_gate_manifest
@@ -34,6 +39,14 @@ from .pilot_runner import (
 from .progressive import PROGRESSIVE_PREFIX_CONTEXT_KEY, ProgressivePrefix
 from .progressive_capture_set import ProgressiveCaptureSet
 from .progressive_gates import ProgressiveBlockGateResult, evaluate_progressive_block_gate
+from .progressive_training_resume import (
+    ProgressiveTrainingResumeIdentity,
+    ProgressiveTrainingResumeRequest,
+    ProgressiveTrainingResumeState,
+    load_progressive_training_resume,
+    restore_progressive_training_resume,
+    save_progressive_training_resume,
+)
 from .route_fit import (
     RouteActivationFit,
     collect_route_activation_statistics,
@@ -349,6 +362,82 @@ def _evaluate_initializations(
     return rows, selected, best_ls
 
 
+def _resume_identity(
+    prefix: ProgressivePrefix,
+    request: ProgressiveTrainingResumeRequest,
+    *,
+    block_index: int,
+    selected_route_mode: RouteInitMode,
+    selected_lambda_relative: float,
+) -> ProgressiveTrainingResumeIdentity:
+    return ProgressiveTrainingResumeIdentity(
+        sweep_id=prefix.sweep_id,
+        code_commit=prefix.code_commit,
+        stage_a_campaign_sha256=prefix.stage_a_campaign_sha256,
+        dataset_manifest_sha256=prefix.dataset_manifest_sha256,
+        gate_manifest_sha256=prefix.gate_manifest_sha256,
+        prefix_identity_sha256=prefix.identity_sha256,
+        prefix_manifest_sha256=request.prefix_manifest_sha256,
+        capture_registry_file_sha256=request.capture_registry_file_sha256,
+        train_plan_identity_sha256=request.train_plan_identity_sha256,
+        train_plan_file_sha256=request.train_plan_file_sha256,
+        block_index=block_index,
+        selected_route_mode=selected_route_mode,
+        selected_lambda_relative=float(selected_lambda_relative),
+    )
+
+
+def _validate_resume_progress(
+    state: ProgressiveTrainingResumeState,
+    plan: Sequence[StageATrainStage],
+    *,
+    train_case_count: int,
+) -> None:
+    if state.stage_index >= len(plan):
+        raise RuntimeError("progressive training resume stage_index exceeds the fixed train plan")
+    spec = plan[state.stage_index]
+    if state.stage != spec.stage:
+        raise RuntimeError("progressive training resume stage differs from the fixed train plan")
+    if state.completed_epochs > spec.epochs:
+        raise RuntimeError("progressive training resume completed_epochs exceeds the fixed stage")
+    if train_case_count <= 0:
+        raise RuntimeError("progressive training resume requires non-empty train cases")
+
+    expected_events = train_case_count * state.completed_epochs
+    for prior in plan[: state.stage_index]:
+        expected_events += train_case_count * prior.epochs
+    if len(state.events) != expected_events:
+        raise RuntimeError(
+            "progressive training resume event count is inconsistent with its stage/epoch progress"
+        )
+
+    offset = 0
+    for prior in plan[: state.stage_index]:
+        count = train_case_count * prior.epochs
+        rows = state.events[offset : offset + count]
+        if any(row.stage != prior.stage or not 0 <= row.epoch < prior.epochs for row in rows):
+            raise RuntimeError("progressive training resume prior-stage events are inconsistent")
+        offset += count
+    rows = state.events[offset:]
+    if any(
+        row.stage != state.stage or not 0 <= row.epoch < state.completed_epochs
+        for row in rows
+    ):
+        raise RuntimeError("progressive training resume current-stage events are inconsistent")
+
+
+def _preflight_resume_request(request: ProgressiveTrainingResumeRequest | None) -> None:
+    if request is None:
+        return
+    path = Path(request.path)
+    if request.resume and not path.is_file():
+        raise FileNotFoundError(f"progressive resume checkpoint does not exist: {path}")
+    if not request.resume and path.exists():
+        raise FileExistsError(
+            f"progressive resume checkpoint already exists; use explicit resume mode or remove it: {path}"
+        )
+
+
 def run_progressive_block_training(
     teacher_block: nn.Module,
     captures: ProgressiveCaptureSet,
@@ -363,6 +452,7 @@ def run_progressive_block_training(
     student_builder: StudentBuilder = _default_builder,
     optimizer_factory: OptimizerFactory = _default_optimizer,
     require_bf16_teacher: bool = True,
+    resume_request: ProgressiveTrainingResumeRequest | None = None,
 ) -> ProgressiveBlockTrainingResult:
     """Train one early-to-late Stage-B block without mutating the accepted prefix/model.
 
@@ -371,10 +461,16 @@ def run_progressive_block_training(
     recorded post-AdaLN execution point before route fitting or optimization begins.
     Lazy capture sets and case sequences are consumed one artifact at a time so production
     training does not retain the complete target-block corpus in CPU or GPU memory.
+
+    When ``resume_request`` is supplied, a mutable crash-recovery checkpoint is replaced
+    atomically after each complete epoch. Resume is explicit and identity-bound to the
+    prefix manifest, capture registry, fixed train plan and selected initialization. A
+    partial epoch is deliberately replayed from the previous completed-epoch checkpoint.
     The returned Keyless block is only a candidate; callers must persist and explicitly
     accept it after ``result.gate.passed`` before replacing the live model block.
     """
 
+    _preflight_resume_request(resume_request)
     block_index = _validate_capture_context(captures, prefix)
     gate_sha = validate_pilot_gate_manifest(gate_manifest)
     if gate_sha.lower() != prefix.gate_manifest_sha256.lower():
@@ -436,26 +532,86 @@ def run_progressive_block_training(
         student_builder=student_builder,
     )
     student.to(device)
-    events: list[PilotTrainingEvent] = []
+
+    resume_identity: ProgressiveTrainingResumeIdentity | None = None
+    resume_state: ProgressiveTrainingResumeState | None = None
+    if resume_request is not None:
+        resume_identity = _resume_identity(
+            prefix,
+            resume_request,
+            block_index=block_index,
+            selected_route_mode=selected.route_mode,
+            selected_lambda_relative=selected.lambda_relative,
+        )
+        if resume_request.resume:
+            resume_state = load_progressive_training_resume(
+                resume_request.path,
+                expected_identity=resume_identity,
+            )
+            _validate_resume_progress(
+                resume_state,
+                plan,
+                train_case_count=len(train_cases),
+            )
+
+    events: list[PilotTrainingEvent] = [] if resume_state is None else list(resume_state.events)
     optimizer: torch.optim.Optimizer | None = None
-    for spec in plan:
+    for stage_index, spec in enumerate(plan):
+        if resume_state is not None and stage_index < resume_state.stage_index:
+            continue
+
         set_pilot_block_stage(student, spec.stage)
         parameters = [parameter for parameter in student.parameters() if parameter.requires_grad]
         if not parameters:
             raise RuntimeError(f"progressive stage {spec.stage!r} exposed no trainable parameters")
         optimizer = optimizer_factory(parameters, spec.learning_rate, spec.weight_decay)
-        events.extend(
-            train_pilot_stage(
-                teacher_block,
-                student,
-                train_cases,
-                optimizer,
-                stage=spec.stage,
-                epochs=spec.epochs,
-                weights=loss_weights,
-                max_grad_norm=spec.max_grad_norm,
+        start_epoch = 0
+        if resume_state is not None and stage_index == resume_state.stage_index:
+            restore_progressive_training_resume(
+                resume_state,
+                student_block=student,
+                optimizer=optimizer,
+                restore_rng=True,
             )
-        )
+            start_epoch = resume_state.completed_epochs
+
+        for epoch in range(start_epoch, spec.epochs):
+            student.train(True)
+            for case in train_cases:
+                report = pilot_train_step(
+                    teacher_block,
+                    student,
+                    case,
+                    optimizer,
+                    weights=loss_weights,
+                    max_grad_norm=spec.max_grad_norm,
+                )
+                events.append(
+                    PilotTrainingEvent(
+                        stage=spec.stage,
+                        epoch=epoch,
+                        case_id=case.case_id,
+                        report=report,
+                    )
+                )
+            if resume_request is not None:
+                assert resume_identity is not None
+                save_progressive_training_resume(
+                    resume_request.path,
+                    student_block=student,
+                    optimizer=optimizer,
+                    identity=resume_identity,
+                    stage_index=stage_index,
+                    stage=spec.stage,
+                    completed_epochs=epoch + 1,
+                    events=tuple(events),
+                )
+
+        # The checkpoint has now been consumed. Later stages use their own optimizer and
+        # inherit the restored student/RNG state exactly once.
+        if resume_state is not None and stage_index == resume_state.stage_index:
+            resume_state = None
+
     assert optimizer is not None
 
     candidate = evaluate_pilot_cases(
