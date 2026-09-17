@@ -7,15 +7,13 @@ import torch
 if __package__:
     from .minimax_h3_keyless.capture_io import CaptureBundleProvenance
     from .minimax_h3_keyless.live_capture import (
+        StageALiveCaptureController,
         build_runtime_execution_descriptor,
+        build_stage_a_capture_spec,
         discover_clean_git_revision,
         install_stage_a_capture_wrapper,
         mark_pinned_stage_a_teacher,
         require_pinned_stage_a_teacher,
-    )
-    from .minimax_h3_keyless.stage_a_bound_capture import (
-        StageALiveCaptureController,
-        build_stage_a_capture_spec,
     )
     from .minimax_h3_keyless.loader import load_keyless_model
     from .minimax_h3_keyless.progressive_authorization import load_progressive_prefix_manifest
@@ -35,15 +33,13 @@ if __package__:
 else:
     from minimax_h3_keyless.capture_io import CaptureBundleProvenance
     from minimax_h3_keyless.live_capture import (
+        StageALiveCaptureController,
         build_runtime_execution_descriptor,
+        build_stage_a_capture_spec,
         discover_clean_git_revision,
         install_stage_a_capture_wrapper,
         mark_pinned_stage_a_teacher,
         require_pinned_stage_a_teacher,
-    )
-    from minimax_h3_keyless.stage_a_bound_capture import (
-        StageALiveCaptureController,
-        build_stage_a_capture_spec,
     )
     from minimax_h3_keyless.loader import load_keyless_model
     from minimax_h3_keyless.progressive_authorization import load_progressive_prefix_manifest
