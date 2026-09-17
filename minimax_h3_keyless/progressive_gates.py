@@ -1,14 +1,62 @@
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Sequence
+import math
+from dataclasses import dataclass, replace
+from typing import Mapping, Sequence
 
 from .contracts import CORE_BLOCKS
-from .pilot_campaign import PilotAggregateMetrics, PilotTrainingEvent
+from .pilot_campaign import (
+    PilotAggregateMetrics,
+    PilotTrainingEvent,
+    validate_pilot_gate_manifest,
+)
 from .pilot_gates import StageABlockGateResult, StageAGatePolicy, evaluate_stage_a_block_gate
 
 
 ProgressiveBlockGateResult = StageABlockGateResult
+
+
+@dataclass(frozen=True)
+class ProgressiveExecutionPolicy:
+    """Predeclared Stage-B implementation tolerances from the fixed gate manifest."""
+
+    fold_atol: float
+    fold_rtol: float
+
+
+def progressive_execution_policy_from_gate_manifest(
+    manifest: Mapping[str, object],
+) -> ProgressiveExecutionPolicy:
+    """Load fold/export tolerances without allowing post-result CLI overrides.
+
+    Stage B reuses the Stage-A numerical fit gate, but folding q/R into deployable Q is a
+    separate finite-precision implementation gate. Its tolerances therefore live in the
+    same immutable gate manifest that is already hash-bound into the progressive prefix.
+    """
+
+    validate_pilot_gate_manifest(manifest)
+    thresholds = manifest["thresholds"]
+    assert isinstance(thresholds, dict)
+    required = ("progressive_fold_atol", "progressive_fold_rtol")
+    missing = [name for name in required if name not in thresholds]
+    if missing:
+        raise ValueError(
+            f"pilot gate manifest is missing progressive execution thresholds: {missing}"
+        )
+
+    values: dict[str, float] = {}
+    for name in required:
+        raw = thresholds[name]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            raise ValueError(f"{name} must be a finite non-negative number")
+        value = float(raw)
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} must be a finite non-negative number")
+        values[name] = value
+    return ProgressiveExecutionPolicy(
+        fold_atol=values["progressive_fold_atol"],
+        fold_rtol=values["progressive_fold_rtol"],
+    )
 
 
 def evaluate_progressive_block_gate(
