@@ -92,8 +92,10 @@ def _append_artifact(
     result_payload = {
         "block_index": block_index,
         "prefix_identity_sha256": prefix.identity_sha256,
+        "selection_split": "train_complete_cases",
         "selected_route_mode": "identity",
         "selected_lambda_relative": 0.0,
+        "least_squares_baseline_lambda_relative": 0.0,
         "gate": {"passed": True, "block_index": block_index},
         "final_stage": "route",
     }
@@ -195,6 +197,23 @@ def test_restore_rejects_result_payload_route_mode_inconsistent_with_identity(tm
     model = Core50()
 
     with pytest.raises(RuntimeError, match="route mode differs"):
+        restore_progressive_model_prefix(model, prefix, output_dir=tmp_path)
+
+    assert isinstance(model.blocks[0].attn, NativeAttention)
+    validate_progressive_model_prefix(model, _empty_prefix())
+
+
+def test_restore_rejects_missing_train_selection_marker_before_mutation(tmp_path: Path) -> None:
+    artifact_model = Core50()
+    prefix, _, _, _ = _append_artifact(
+        tmp_path,
+        artifact_model,
+        _empty_prefix(),
+        payload_overrides={"selection_split": "holdout"},
+    )
+    model = Core50()
+
+    with pytest.raises(RuntimeError, match="train-only initialization selection"):
         restore_progressive_model_prefix(model, prefix, output_dir=tmp_path)
 
     assert isinstance(model.blocks[0].attn, NativeAttention)

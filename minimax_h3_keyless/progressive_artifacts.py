@@ -20,8 +20,8 @@ from .progressive_capture_set import ProgressiveBlockCaptureSet
 from .progressive_runner import ProgressiveBlockTrainingResult
 
 
-PROGRESSIVE_RESUME_SCHEMA = "minimax_h3_keyless_progressive_resume_v1"
-PROGRESSIVE_RESULT_SCHEMA = "minimax_h3_keyless_progressive_block_result_v1"
+PROGRESSIVE_RESUME_SCHEMA = "minimax_h3_keyless_progressive_resume_v2"
+PROGRESSIVE_RESULT_SCHEMA = "minimax_h3_keyless_progressive_block_result_v2"
 _SAFE_STEM = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 _STAGE_NAMES = ("route", "query", "value", "norm_out")
 
@@ -184,12 +184,14 @@ def _result_payload(result: ProgressiveBlockTrainingResult) -> dict[str, Any]:
     return {
         "block_index": result.block_index,
         "prefix_identity_sha256": result.prefix_identity_sha256,
+        "selection_split": result.selection_split,
         "replay_reports": [asdict(row) for row in result.replay_reports],
         "initialization_evaluations": [asdict(row) for row in result.initialization_evaluations],
         "selected_route_mode": result.selected_route_mode,
         "selected_lambda_relative": result.selected_lambda_relative,
         "identity_baseline": asdict(result.identity_baseline),
         "least_squares_baseline": asdict(result.least_squares_baseline),
+        "least_squares_baseline_lambda_relative": result.least_squares_baseline_lambda_relative,
         "candidate": asdict(result.candidate),
         "candidate_attention_diagnostics": [
             asdict(row) for row in result.candidate_attention_diagnostics
@@ -247,9 +249,10 @@ def persist_progressive_block_artifacts(
     """Persist one immutable Stage-B training checkpoint/result transaction.
 
     The checkpoint preserves the training-form q/R/v weights, final optimizer state and
-    Python/NumPy/Torch RNG state. The result sidecar binds the complete numerical evidence
-    and ordered immutable live-input capture-set identity. Neither final path is replaced
-    if a prior accepted or failed experiment already owns that artifact identity.
+    Python/NumPy/Torch RNG state. The result sidecar binds the complete numerical evidence,
+    train-only initialization-selection marker and ordered immutable live-input capture-set
+    identity. Neither final path is replaced if a prior accepted or failed experiment
+    already owns that artifact identity.
     """
     identity = progressive_run_identity(prefix, captures, result)
     stage = result.final_stage

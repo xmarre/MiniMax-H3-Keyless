@@ -56,6 +56,7 @@ from .route_fit import (
 
 StudentBuilder = Callable[[nn.Module, int, RouteInitMode, float], tuple[nn.Module, object]]
 OptimizerFactory = Callable[[Sequence[nn.Parameter], float, float], torch.optim.Optimizer]
+_SELECTION_SPLIT = "train_complete_cases"
 
 
 @dataclass
@@ -71,12 +72,14 @@ class ProgressiveBlockTrainingResult:
 
     block_index: int
     prefix_identity_sha256: str
+    selection_split: str
     replay_reports: tuple[CapturedReplayReport, ...]
     initialization_evaluations: tuple[StageAInitializationEvaluation, ...]
     selected_route_mode: RouteInitMode
     selected_lambda_relative: float
     identity_baseline: PilotAggregateMetrics
     least_squares_baseline: PilotAggregateMetrics
+    least_squares_baseline_lambda_relative: float
     candidate: PilotAggregateMetrics
     candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...]
     training_events: tuple[PilotTrainingEvent, ...]
@@ -293,7 +296,7 @@ def _attention_diagnostics(
         for record in records
     )
     if not out:
-        raise RuntimeError("progressive attention diagnostics require holdout captures")
+        raise RuntimeError("progressive attention diagnostics require captured cases")
     if tuple(row.case_id for row in out) != tuple(record.case.case_id for record in records):
         raise RuntimeError("progressive attention diagnostic case ordering diverged from captures")
     return out
@@ -303,8 +306,8 @@ def _evaluate_initializations(
     teacher_block: nn.Module,
     *,
     block_index: int,
-    holdout_cases,
-    holdout_records,
+    train_cases,
+    train_records,
     device: torch.device,
     weights: PilotLossWeights,
     route_fits: Mapping[float, RouteActivationFit],
@@ -333,10 +336,10 @@ def _evaluate_initializations(
         metrics = evaluate_pilot_cases(
             teacher_block,
             student,
-            holdout_cases,
+            train_cases,
             weights=weights,
         )
-        diagnostics = _attention_diagnostics(teacher_block, student, holdout_records)
+        diagnostics = _attention_diagnostics(teacher_block, student, train_records)
         fit = None if route_mode == "identity" else route_fits[float(lambda_relative)]
         evaluations.append(
             StageAInitializationEvaluation(
@@ -360,6 +363,39 @@ def _evaluate_initializations(
         ),
     )
     return rows, selected, best_ls
+
+
+def _evaluate_untrained_baseline(
+    teacher_block: nn.Module,
+    cases,
+    *,
+    block_index: int,
+    device: torch.device,
+    weights: PilotLossWeights,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> PilotAggregateMetrics:
+    student = _build_student(
+        teacher_block,
+        block_index=block_index,
+        route_mode=route_mode,
+        lambda_relative=lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    student.to(device)
+    student.eval()
+    try:
+        return evaluate_pilot_cases(
+            teacher_block,
+            student,
+            cases,
+            weights=weights,
+        )
+    finally:
+        del student
 
 
 def _resume_identity(
@@ -465,13 +501,17 @@ def run_progressive_block_training(
     Captures must come from the current partially converted model under ``prefix``. The
     frozen original QKV block is replayed on those exact inputs and must reproduce the
     recorded post-AdaLN execution point before route fitting or optimization begins.
+    Initialization and LS-lambda selection use complete training cases only. The holdout
+    is evaluated only for the train-selected untrained baselines and the trained candidate
+    that feed the frozen progressive exit gate.
+
     Lazy capture sets and case sequences are consumed one artifact at a time so production
     training does not retain the complete target-block corpus in CPU or GPU memory.
 
     When ``resume_request`` is supplied, a mutable crash-recovery checkpoint is replaced
     atomically after each complete epoch. Resume is explicit and identity-bound to the
-    prefix manifest, capture registry, fixed train plan and selected initialization. A
-    partial epoch is deliberately replayed from the previous completed-epoch checkpoint.
+    prefix manifest, capture registry, fixed train plan and train-selected initialization.
+    A partial epoch is deliberately replayed from the previous completed-epoch checkpoint.
     The returned Keyless block is only a candidate; callers must persist and explicitly
     accept it after ``result.gate.passed`` before replacing the live model block.
     """
@@ -520,14 +560,35 @@ def run_progressive_block_training(
     evaluations, selected, best_ls = _evaluate_initializations(
         teacher_block,
         block_index=block_index,
-        holdout_cases=holdout_cases,
-        holdout_records=holdout_records,
+        train_cases=train_cases,
+        train_records=train_records,
         device=device,
         weights=loss_weights,
         route_fits=route_fits,
         student_builder=student_builder,
     )
-    identity = next(row for row in evaluations if row.route_mode == "identity")
+    identity_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="identity",
+        lambda_relative=0.0,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    least_squares_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="least_squares",
+        lambda_relative=best_ls.lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
 
     student = _build_student(
         teacher_block,
@@ -631,8 +692,8 @@ def run_progressive_block_training(
     gate = evaluate_progressive_block_gate(
         block_index=block_index,
         candidate=candidate,
-        identity_baseline=identity.metrics,
-        least_squares_baseline=best_ls.metrics,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
         training_events=event_tuple,
         policy=policy,
     )
@@ -640,12 +701,14 @@ def run_progressive_block_training(
     return ProgressiveBlockTrainingResult(
         block_index=block_index,
         prefix_identity_sha256=prefix.identity_sha256,
+        selection_split=_SELECTION_SPLIT,
         replay_reports=replay_reports,
         initialization_evaluations=evaluations,
         selected_route_mode=selected.route_mode,
         selected_lambda_relative=selected.lambda_relative,
-        identity_baseline=identity.metrics,
-        least_squares_baseline=best_ls.metrics,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
+        least_squares_baseline_lambda_relative=best_ls.lambda_relative,
         candidate=candidate,
         candidate_attention_diagnostics=candidate_diagnostics,
         training_events=event_tuple,

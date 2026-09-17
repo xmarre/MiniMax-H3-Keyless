@@ -12,7 +12,7 @@ from .attention import KeylessAttentionDeploy, KeylessAttentionTrain
 from .checkpoint import sha256_file
 from .export import fold_query_route_weight
 from .pilot import _native_attention_facts
-from .pilot_campaign import canonical_json_sha256
+from .pilot_campaign import PILOT_LS_LAMBDAS, canonical_json_sha256
 from .progressive import ProgressiveAcceptedBlock, ProgressivePrefix, validate_progressive_model_prefix
 from .progressive_artifacts import (
     PROGRESSIVE_RESULT_SCHEMA,
@@ -22,6 +22,7 @@ from .progressive_artifacts import (
 
 
 StudentBuilder = Callable[[nn.Module, int], nn.Module]
+_SELECTION_SPLIT = "train_complete_cases"
 
 
 @dataclass(frozen=True)
@@ -177,6 +178,10 @@ def _load_result(
         raise RuntimeError("accepted progressive numerical payload names the wrong prior prefix")
     if result_payload.get("final_stage") != accepted.final_stage:
         raise RuntimeError("accepted progressive numerical payload names the wrong final stage")
+    if result_payload.get("selection_split") != _SELECTION_SPLIT:
+        raise RuntimeError(
+            "accepted progressive result does not record train-only initialization selection"
+        )
     if result_payload.get("selected_route_mode") != identity.route_mode:
         raise RuntimeError("accepted progressive numerical payload route mode differs from run identity")
     try:
@@ -185,6 +190,16 @@ def _load_result(
         raise RuntimeError("accepted progressive numerical payload has an invalid route lambda") from exc
     if selected_lambda != float(identity.lambda_relative):
         raise RuntimeError("accepted progressive numerical payload route lambda differs from run identity")
+    try:
+        baseline_lambda = float(result_payload.get("least_squares_baseline_lambda_relative"))
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "accepted progressive numerical payload has an invalid train-selected LS baseline lambda"
+        ) from exc
+    if baseline_lambda not in PILOT_LS_LAMBDAS:
+        raise RuntimeError(
+            "accepted progressive numerical payload LS baseline lambda is outside the fixed grid"
+        )
     gate = result_payload.get("gate")
     if not isinstance(gate, dict) or gate.get("passed") is not True:
         raise RuntimeError("accepted progressive result does not record a passed numerical gate")
@@ -418,8 +433,8 @@ def restore_progressive_model_prefix(
     The input model must begin as the native core50 teacher. Blocks are restored strictly
     early-to-late. Each accepted result/checkpoint pair is hash-checked against the prefix,
     its run identity must extend the exact prior prefix, its numerical gate must record a
-    pass, and the training-form q/R/v attention state is loaded strictly before being
-    folded to deploy QV form.
+    pass, and the v2 result must record train-only initialization selection before the
+    training-form q/R/v attention state is loaded strictly and folded to deploy QV form.
 
     Only ``block.attn`` is replaced. Frozen MLP/AdaLN/non-attention tensors remain the
     original pinned-teacher objects, avoiding a full H3 block deepcopy for every restored
