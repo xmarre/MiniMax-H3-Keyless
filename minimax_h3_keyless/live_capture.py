@@ -494,6 +494,7 @@ def build_stage_a_capture_spec(
     validate_stage_a_manifest_assets_for_workflow(
         case,
         workflow_prompt,
+        capture_node_id=capture_node_id,
         asset_path_resolver=asset_path_resolver,
     )
 
