@@ -7,7 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 import torch
 
@@ -17,6 +17,12 @@ from .contracts import TARGET_MODEL_REVISION, TEACHER_SHA256
 from .native_capture_policy import require_plain_native_capture_options
 from .pilot_campaign import PILOT_BLOCKS, load_json_manifest, validate_pilot_dataset_manifest
 from .pilot_inputs import CANONICAL_STAGE_A_COVERAGE_TAGS
+from .stage_a_execution_binding import (
+    WORKFLOW_CONTEXT_KEY,
+    canonical_stage_a_workflow_prompt_sha256,
+    require_manifest_case_workflow_prompt_sha256,
+    validate_stage_a_manifest_assets_for_workflow,
+)
 from .teacher import validate_loaded_native_teacher_model
 
 
@@ -50,15 +56,20 @@ class StageACaptureSpec:
     target_sigma: float
     output_path: str
     max_capture_bytes: int
+    workflow_prompt_sha256: str
     sigma_tolerance: float = 1e-6
 
     def __post_init__(self) -> None:
-        if len(self.dataset_manifest_sha256) != 64:
-            raise ValueError("Stage-A dataset manifest identity must be a SHA-256")
-        try:
-            int(self.dataset_manifest_sha256, 16)
-        except ValueError as exc:
-            raise ValueError("Stage-A dataset manifest identity must be a SHA-256") from exc
+        for name, value in (
+            ("dataset manifest", self.dataset_manifest_sha256),
+            ("workflow prompt", self.workflow_prompt_sha256),
+        ):
+            if not isinstance(value, str) or len(value) != 64:
+                raise ValueError(f"Stage-A {name} identity must be a SHA-256")
+            try:
+                int(value, 16)
+            except ValueError as exc:
+                raise ValueError(f"Stage-A {name} identity must be a SHA-256") from exc
         if not self.source_case_id.strip():
             raise ValueError("Stage-A source case_id must be non-empty")
         if self.split not in ("train", "holdout"):
@@ -335,6 +346,7 @@ class StageALiveCaptureController:
             "stage_a_declared_video_sigma": float(self.spec.target_sigma),
             "stage_a_observed_video_sigma": float(observed_sigma),
             "stage_a_sigma_tolerance": float(self.spec.sigma_tolerance),
+            WORKFLOW_CONTEXT_KEY: self.spec.workflow_prompt_sha256.lower(),
         }
         with PilotActivationCapture(
             self.inner_model,
@@ -442,6 +454,9 @@ def build_stage_a_capture_spec(
     case_id: str,
     target_sigma: float,
     output_root: str | Path,
+    workflow_prompt: Mapping[str, Any],
+    capture_node_id: str | int,
+    asset_path_resolver: Callable[[str], str | Path] | None,
     output_subdir: str = "keyless_stage_a",
     max_capture_mib: int = 8192,
     sigma_tolerance: float = 1e-6,
@@ -465,6 +480,23 @@ def build_stage_a_capture_spec(
         )
     if isinstance(max_capture_mib, bool) or not isinstance(max_capture_mib, int) or max_capture_mib <= 0:
         raise ValueError("Stage-A max_capture_mib must be a positive integer")
+
+    expected_workflow = require_manifest_case_workflow_prompt_sha256(case, case_id=case_id)
+    actual_workflow = canonical_stage_a_workflow_prompt_sha256(
+        workflow_prompt,
+        capture_node_id=capture_node_id,
+    )
+    if actual_workflow.lower() != expected_workflow.lower():
+        raise ValueError(
+            "executed Comfy API prompt does not match the predeclared Stage-A workflow "
+            f"identity for case {case_id!r}: expected={expected_workflow}, actual={actual_workflow}"
+        )
+    validate_stage_a_manifest_assets_for_workflow(
+        case,
+        workflow_prompt,
+        asset_path_resolver=asset_path_resolver,
+    )
+
     output_dir = resolve_output_subdir(output_root, output_subdir)
     output_path = output_dir / _case_filename(case_id, float(target_sigma))
     spec = StageACaptureSpec(
@@ -475,6 +507,7 @@ def build_stage_a_capture_spec(
         target_sigma=float(target_sigma),
         output_path=str(output_path),
         max_capture_bytes=int(max_capture_mib) * 1024 * 1024,
+        workflow_prompt_sha256=actual_workflow,
         sigma_tolerance=float(sigma_tolerance),
     )
     spec.assert_available()
