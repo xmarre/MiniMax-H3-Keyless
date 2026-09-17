@@ -167,6 +167,7 @@ def validate_pilot_dataset_manifest(
     splits: set[str] = set()
     sigma_values: set[float] = set()
     coverage: set[str] = set()
+    asset_owners: dict[str, tuple[str, str]] = {}
     for index, case in enumerate(cases):
         if not isinstance(case, dict):
             raise ValueError(f"pilot case {index} must be an object")
@@ -219,7 +220,18 @@ def validate_pilot_dataset_manifest(
         for asset in assets:
             if not isinstance(asset, dict) or not isinstance(asset.get("path_or_uri"), str):
                 raise ValueError(f"pilot case {case_id!r} contains an invalid asset record")
-            _require_sha256(f"asset SHA-256 for {case_id}", asset.get("sha256", ""))
+            asset_sha = _require_sha256(
+                f"asset SHA-256 for {case_id}", asset.get("sha256", "")
+            )
+            previous = asset_owners.get(asset_sha)
+            if previous is None:
+                asset_owners[asset_sha] = (split, case_id)
+            elif previous[0] != split:
+                raise ValueError(
+                    "pilot dataset asset crosses train/holdout split: "
+                    f"sha256={asset_sha}, first_case={previous[1]!r} ({previous[0]}), "
+                    f"current_case={case_id!r} ({split})"
+                )
     if splits != {"train", "holdout"}:
         raise ValueError("pilot dataset must contain complete-case train and holdout splits")
     if len(sigma_values) < minimum_sigma_strata:
