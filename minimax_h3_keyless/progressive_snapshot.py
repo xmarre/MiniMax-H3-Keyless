@@ -10,16 +10,15 @@ from typing import Any, Mapping
 
 import torch
 import torch.nn as nn
-from safetensors import safe_open
 from safetensors.torch import load_file, save_file
 
 from .attention import KeylessAttentionDeploy
 from .checkpoint import (
     CheckpointValidationError,
-    _dtype_name,
     _require_dtype,
     _require_shape,
     _validate_pruned_adaln,
+    read_safetensors_signatures,
     sha256_file,
 )
 from .contracts import (
@@ -397,12 +396,7 @@ def validate_progressive_snapshot_file(
     """Validate snapshot bytes, embedded metadata, topology and optional sidecar receipt."""
 
     snapshot_path = Path(snapshot_path)
-    with safe_open(str(snapshot_path), framework="pt", device="cpu") as handle:
-        metadata = dict(handle.metadata() or {})
-        tensors = {
-            key: handle.get_slice(key)
-            for key in handle.keys()
-        }
+    tensors, metadata = read_safetensors_signatures(snapshot_path)
     validate_progressive_snapshot_metadata(
         metadata,
         prefix,
