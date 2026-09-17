@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import random
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -21,6 +22,31 @@ from .pilot_campaign import (
 
 PROGRESSIVE_TRAINING_RESUME_SCHEMA = "minimax_h3_keyless_progressive_training_resume_v1"
 _STAGE_NAMES = ("route", "query", "value", "norm_out")
+
+
+@dataclass(frozen=True)
+class ProgressiveTrainingResumeRequest:
+    """Caller-supplied immutable bindings plus explicit fresh/resume intent."""
+
+    path: str
+    prefix_manifest_sha256: str
+    capture_registry_file_sha256: str
+    train_plan_identity_sha256: str
+    train_plan_file_sha256: str
+    resume: bool = False
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.path, str) or not self.path.strip():
+            raise ValueError("progressive resume path must be non-empty")
+        for name in (
+            "prefix_manifest_sha256",
+            "capture_registry_file_sha256",
+            "train_plan_identity_sha256",
+            "train_plan_file_sha256",
+        ):
+            object.__setattr__(self, name, _require_sha256(name, getattr(self, name)))
+        if not isinstance(self.resume, bool):
+            raise ValueError("progressive resume intent must be boolean")
 
 
 @dataclass(frozen=True)
@@ -90,7 +116,7 @@ class ProgressiveTrainingResumeState:
 
 def _capture_rng_state() -> dict[str, Any]:
     state: dict[str, Any] = {
-        "python": __import__("random").getstate(),
+        "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch_cpu": torch.get_rng_state(),
     }
@@ -100,7 +126,7 @@ def _capture_rng_state() -> dict[str, Any]:
 
 
 def _restore_rng_state(state: Mapping[str, Any]) -> None:
-    __import__("random").setstate(state["python"])
+    random.setstate(state["python"])
     np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch_cpu"])
     if "torch_cuda" in state:
