@@ -25,6 +25,10 @@ from .progressive_gates import (
 )
 from .progressive_restore import restore_progressive_model_prefix
 from .progressive_runner import ProgressiveBlockTrainingResult, run_progressive_block_training
+from .progressive_training_resume import (
+    ProgressiveTrainingResumeRequest,
+    remove_progressive_training_resume,
+)
 from .progressive_workflow import ProgressiveAcceptedStep, accept_persisted_progressive_block
 from .stage_a_campaign_result import StageACampaignEvidence, load_stage_a_campaign_evidence
 from .teacher import LoadedNativeTeacher, load_pinned_bf16_teacher
@@ -169,12 +173,28 @@ def load_progressive_training_captures(
     return captures
 
 
+def _training_resume_path(
+    artifact_dir: str | Path,
+    prefix: ProgressivePrefix,
+    target: int,
+    requested: str | Path | None,
+) -> Path:
+    if requested is not None:
+        path = Path(requested)
+        if not str(path):
+            raise ValueError("progressive training resume path must be non-empty")
+        return path
+    return Path(artifact_dir) / f"{prefix.sweep_id}.block{target:02d}.training-resume.pt"
+
+
 def run_progressive_block_campaign(
     inputs: ProgressiveBlockRunInputs,
     *,
     teacher_path: str | Path,
     artifact_dir: str | Path,
     device: str,
+    resume: bool = False,
+    resume_path: str | Path | None = None,
 ) -> ProgressiveBlockRunOutcome:
     """Train, persist and conditionally accept exactly the current Stage-B block.
 
@@ -182,6 +202,12 @@ def run_progressive_block_campaign(
     failed candidate never mutates the accepted model and never publishes a new prefix.
     A passed candidate is accepted from those already-persisted bytes, so evidence is not
     written twice and a prefix-publication failure can roll the live target block back.
+
+    A mutable crash-recovery checkpoint is maintained after every complete training epoch.
+    Starting fresh refuses to overwrite an existing recovery file; continuation requires
+    explicit ``resume=True``. The recovery file is deleted only after the immutable candidate
+    checkpoint/result transaction has succeeded, regardless of whether the candidate gate
+    passes. It is therefore never the authority for an accepted block.
     """
 
     require_progressive_runtime_provenance(inputs)
@@ -200,6 +226,20 @@ def run_progressive_block_campaign(
     if blocks is None or len(blocks) <= target:
         raise RuntimeError("loaded H3 model does not expose the progressive target block")
 
+    recovery_path = _training_resume_path(
+        artifact_dir,
+        inputs.prefix,
+        target,
+        resume_path,
+    )
+    resume_request = ProgressiveTrainingResumeRequest(
+        path=str(recovery_path),
+        prefix_manifest_sha256=inputs.prefix_manifest_sha256,
+        capture_registry_file_sha256=inputs.registry.registry_file_sha256,
+        train_plan_identity_sha256=inputs.train_plan.plan_identity_sha256,
+        train_plan_file_sha256=inputs.train_plan.plan_file_sha256,
+        resume=bool(resume),
+    )
     result: ProgressiveBlockTrainingResult = run_progressive_block_training(
         blocks[target],
         captures,
@@ -210,6 +250,7 @@ def run_progressive_block_campaign(
         loss_weights=inputs.train_plan.loss_weights,
         same_input_atol=inputs.train_plan.same_input_atol,
         same_input_rtol=inputs.train_plan.same_input_rtol,
+        resume_request=resume_request,
     )
     artifact = persist_progressive_block_artifacts(
         artifact_dir,
@@ -217,6 +258,7 @@ def run_progressive_block_campaign(
         captures=captures,
         result=result,
     )
+    remove_progressive_training_resume(recovery_path)
     if not result.gate.passed:
         return ProgressiveBlockRunOutcome(
             block_index=target,
