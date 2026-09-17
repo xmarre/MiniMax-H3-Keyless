@@ -112,18 +112,70 @@ def _collect_prompt_strings(value: Any, out: set[str]) -> None:
             _collect_prompt_strings(item, out)
 
 
+def _collect_linked_node_ids(value: Any, known_ids: set[str], out: set[str]) -> None:
+    if isinstance(value, (tuple, list)):
+        if (
+            len(value) == 2
+            and not isinstance(value[0], (dict, list, tuple))
+            and str(value[0]) in known_ids
+            and isinstance(value[1], int)
+            and not isinstance(value[1], bool)
+        ):
+            out.add(str(value[0]))
+            return
+        for item in value:
+            _collect_linked_node_ids(item, known_ids, out)
+        return
+    if isinstance(value, Mapping):
+        for item in value.values():
+            _collect_linked_node_ids(item, known_ids, out)
+
+
+def _capture_connected_node_ids(
+    prompt: Mapping[str, Any],
+    *,
+    capture_node_id: str | int,
+) -> set[str]:
+    known_ids = {str(key) for key in prompt}
+    start = str(capture_node_id)
+    if start not in known_ids:
+        raise ValueError(f"Stage-A capture node id {start!r} is absent from the executed API prompt")
+    adjacency = {node_id: set() for node_id in known_ids}
+    for raw_id, raw_node in prompt.items():
+        node_id = str(raw_id)
+        if not isinstance(raw_node, Mapping):
+            continue
+        linked: set[str] = set()
+        _collect_linked_node_ids(raw_node.get("inputs", {}), known_ids, linked)
+        for other in linked:
+            adjacency[node_id].add(other)
+            adjacency[other].add(node_id)
+
+    connected: set[str] = set()
+    pending = [start]
+    while pending:
+        node_id = pending.pop()
+        if node_id in connected:
+            continue
+        connected.add(node_id)
+        pending.extend(adjacency[node_id].difference(connected))
+    return connected
+
+
 def validate_stage_a_manifest_assets_for_workflow(
     case: Mapping[str, Any],
     prompt: Mapping[str, Any],
     *,
+    capture_node_id: str | int,
     asset_path_resolver: Callable[[str], str | Path] | None,
 ) -> None:
-    """Bind manifest asset identities to file literals in the executed Comfy prompt.
+    """Bind manifest asset identities to file literals on the capture-connected graph.
 
-    Canonical Stage-A evidence is intentionally file-backed. The API prompt must contain
-    every declared ``path_or_uri`` literally and the path resolved by Comfy must hash to the
-    manifest SHA-256. Remote/dynamic assets without a locally resolvable immutable file are
-    therefore rejected for the canonical Stage-A corpus instead of being operator-attested.
+    Canonical Stage-A evidence is intentionally file-backed. Every declared ``path_or_uri``
+    must occur on the same statically connected Comfy API graph as the Stage-A capture node,
+    and the path resolved by Comfy must hash to the manifest SHA-256. A disconnected/dead
+    loader node is not enough. Remote/dynamic assets without a locally resolvable immutable
+    file are rejected instead of being operator-attested.
     """
     assets = case.get("assets", [])
     if not isinstance(assets, list):
@@ -135,8 +187,11 @@ def validate_stage_a_manifest_assets_for_workflow(
             "Stage-A cases with assets require a Comfy asset-path resolver for byte verification"
         )
 
+    connected = _capture_connected_node_ids(prompt, capture_node_id=capture_node_id)
     prompt_strings: set[str] = set()
-    _collect_prompt_strings(prompt, prompt_strings)
+    for raw_id, node in prompt.items():
+        if str(raw_id) in connected:
+            _collect_prompt_strings(node, prompt_strings)
     case_id = str(case.get("case_id", "<unknown>"))
     for index, asset in enumerate(assets):
         if not isinstance(asset, Mapping):
@@ -148,8 +203,8 @@ def validate_stage_a_manifest_assets_for_workflow(
             )
         if declared not in prompt_strings:
             raise ValueError(
-                f"Stage-A case {case_id!r} asset {declared!r} is not referenced literally "
-                "by the executed Comfy API prompt"
+                f"Stage-A case {case_id!r} asset {declared!r} is not referenced on the "
+                "capture-connected executed Comfy API graph"
             )
         expected = _require_sha256(
             f"Stage-A case {case_id!r} asset {declared!r} SHA-256",
