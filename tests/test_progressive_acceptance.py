@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -220,7 +222,7 @@ def _no_update_optimizer(parameters, learning_rate, weight_decay):
     return torch.optim.SGD(parameters, lr=0.0, weight_decay=0.0)
 
 
-def test_progressive_acceptance_persists_folds_installs_and_advances_atomically(tmp_path) -> None:
+def _candidate(tmp_path):
     torch.manual_seed(901)
     model = TinyCore50()
     gate_manifest = _gate_manifest()
@@ -228,7 +230,6 @@ def test_progressive_acceptance_persists_folds_installs_and_advances_atomically(
     prefix = _prefix(manifest, gate_manifest)
     validate_progressive_model_prefix(model, prefix)
     captures = _captures(tmp_path / "captures", model.blocks[0], prefix, manifest)
-
     result = run_progressive_block_training(
         model.blocks[0],
         captures,
@@ -241,14 +242,19 @@ def test_progressive_acceptance_persists_folds_installs_and_advances_atomically(
         require_bf16_teacher=False,
     )
     assert result.gate.passed is True
-    assert isinstance(model.blocks[0].attn, TinyNativeAttention)
-
     receipt = persist_progressive_block_artifacts(
         tmp_path / "results",
         prefix=prefix,
         captures=captures,
         result=result,
     )
+    return model, gate_manifest, prefix, captures, result, receipt
+
+
+def test_progressive_acceptance_persists_folds_installs_and_advances_atomically(tmp_path) -> None:
+    model, gate_manifest, prefix, captures, result, receipt = _candidate(tmp_path)
+    assert isinstance(model.blocks[0].attn, TinyNativeAttention)
+
     advanced = accept_progressive_block(
         model,
         prefix,
@@ -268,3 +274,24 @@ def test_progressive_acceptance_persists_folds_installs_and_advances_atomically(
     assert isinstance(model.blocks[1].attn, TinyNativeAttention)
     assert not hasattr(model.blocks[0].attn, "query_route")
     validate_progressive_model_prefix(model, advanced)
+
+
+def test_progressive_acceptance_rejects_forged_holdout_selection_marker_before_mutation(tmp_path) -> None:
+    model, gate_manifest, prefix, captures, result, receipt = _candidate(tmp_path)
+    original_attention = model.blocks[0].attn
+    forged = replace(result, selection_split="holdout")
+
+    with pytest.raises(RuntimeError, match="train-only initialization selection"):
+        accept_progressive_block(
+            model,
+            prefix,
+            captures,
+            forged,
+            receipt,
+            gate_manifest=gate_manifest,
+            fold_atol=1e-5,
+            fold_rtol=1e-5,
+        )
+
+    assert model.blocks[0].attn is original_attention
+    validate_progressive_model_prefix(model, prefix)
