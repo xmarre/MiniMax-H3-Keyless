@@ -15,6 +15,10 @@ from minimax_h3_keyless.stage_a_execution_binding import (
 
 def _prompt(*, text: str = "a lighthouse", seed: int = 123, asset: str = "ref.png") -> dict:
     return {
+        "2": {
+            "class_type": "MiniMaxH3StageATeacherLoader",
+            "inputs": {"model_name": "h3.safetensors"},
+        },
         "4": {
             "class_type": "LoadImage",
             "inputs": {"image": asset},
@@ -46,6 +50,14 @@ def _prompt(*, text: str = "a lighthouse", seed: int = 123, asset: str = "ref.pn
                 "sigma_tolerance": 1e-6,
             },
             "_meta": {"title": "Capture A"},
+        },
+        "30": {
+            "class_type": "KSampler",
+            "inputs": {
+                "model": ["20", 0],
+                "conditioning": ["7", 0],
+                "noise": ["10", 0],
+            },
         },
     }
 
@@ -111,7 +123,7 @@ def test_manifest_workflow_hash_and_record_context_are_strict_sha256() -> None:
         require_record_workflow_prompt_sha256(record)
 
 
-def test_manifest_assets_must_be_prompt_referenced_and_match_resolved_bytes(tmp_path: Path) -> None:
+def test_manifest_assets_must_be_capture_connected_and_match_resolved_bytes(tmp_path: Path) -> None:
     asset = tmp_path / "ref.png"
     asset.write_bytes(b"stage-a-reference-bytes")
     import hashlib
@@ -126,13 +138,25 @@ def test_manifest_assets_must_be_prompt_referenced_and_match_resolved_bytes(tmp_
     validate_stage_a_manifest_assets_for_workflow(
         case,
         prompt,
+        capture_node_id="20",
         asset_path_resolver=lambda value: tmp_path / value,
     )
 
-    with pytest.raises(ValueError, match="not referenced literally"):
+    with pytest.raises(ValueError, match="not referenced on the capture-connected"):
         validate_stage_a_manifest_assets_for_workflow(
             case,
             _prompt(asset="other.png"),
+            capture_node_id="20",
+            asset_path_resolver=lambda value: tmp_path / value,
+        )
+
+    disconnected = _prompt(asset="other.png")
+    disconnected["99"] = {"class_type": "LoadImage", "inputs": {"image": "ref.png"}}
+    with pytest.raises(ValueError, match="not referenced on the capture-connected"):
+        validate_stage_a_manifest_assets_for_workflow(
+            case,
+            disconnected,
+            capture_node_id="20",
             asset_path_resolver=lambda value: tmp_path / value,
         )
 
@@ -141,5 +165,6 @@ def test_manifest_assets_must_be_prompt_referenced_and_match_resolved_bytes(tmp_
         validate_stage_a_manifest_assets_for_workflow(
             case,
             prompt,
+            capture_node_id="20",
             asset_path_resolver=lambda value: tmp_path / value,
         )
