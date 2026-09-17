@@ -206,28 +206,39 @@ def _diagnostics(lambda_relative: float) -> RouteActivationFitDiagnostics:
     )
 
 
-def test_stage_plan_enforces_monotonic_escalation_and_value_before_norm_out() -> None:
+def test_stage_plan_enforces_monotonic_escalation_and_defers_norm_out() -> None:
     plan = validate_stage_a_train_plan(
         (
             StageATrainStage("route", 1, 1e-3),
             StageATrainStage("value", 1, 1e-4),
-            StageATrainStage("norm_out", 1, 1e-5),
         )
     )
-    assert [row.stage for row in plan] == ["route", "value", "norm_out"]
+    assert [row.stage for row in plan] == ["route", "value"]
     with pytest.raises(ValueError, match="start with route"):
         validate_stage_a_train_plan((StageATrainStage("query", 1, 1e-3),))
     with pytest.raises(ValueError, match="repeats"):
         validate_stage_a_train_plan(
             (StageATrainStage("route", 1, 1e-3), StageATrainStage("route", 1, 1e-3))
         )
-    with pytest.raises(ValueError, match="requires value"):
+    with pytest.raises(ValueError, match="route→query→value"):
         validate_stage_a_train_plan(
-            (StageATrainStage("route", 1, 1e-3), StageATrainStage("norm_out", 1, 1e-4))
+            (
+                StageATrainStage("route", 1, 1e-3),
+                StageATrainStage("value", 1, 1e-4),
+                StageATrainStage("query", 1, 1e-4),
+            )
+        )
+    with pytest.raises(ValueError, match="does not authorize norm_out"):
+        validate_stage_a_train_plan(
+            (
+                StageATrainStage("route", 1, 1e-3),
+                StageATrainStage("value", 1, 1e-4),
+                StageATrainStage("norm_out", 1, 1e-5),
+            )
         )
 
 
-def test_initialization_selection_prefers_holdout_attention_error_then_block_error() -> None:
+def test_initialization_selection_prefers_training_attention_error_then_block_error() -> None:
     evaluations = (
         StageAInitializationEvaluation("identity", 0.0, _metric(0.3, 0.1)),
         StageAInitializationEvaluation("least_squares", 0.0, _metric(0.2, 0.2), _diagnostics(0.0)),

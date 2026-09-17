@@ -79,7 +79,9 @@ def test_train_plan_is_fully_predeclared_and_hash_bound(tmp_path: Path) -> None:
     assert len(plan.plan_file_sha256) == 64
 
 
-def test_train_plan_rejects_nan_unknown_fields_and_noninteger_epochs(tmp_path: Path) -> None:
+def test_train_plan_rejects_nan_unknown_fields_noninteger_epochs_and_ungated_norm_out(
+    tmp_path: Path,
+) -> None:
     path = tmp_path / "plan.json"
     value = _plan()
     value["stages"][0]["learning_rate"] = float("nan")
@@ -97,4 +99,16 @@ def test_train_plan_rejects_nan_unknown_fields_and_noninteger_epochs(tmp_path: P
     value["surprise"] = True
     path.write_text(json.dumps(value), encoding="utf-8")
     with pytest.raises(ValueError, match="unknown fields"):
+        load_stage_a_run_plan(path)
+
+    value = _plan()
+    value["stages"].append(
+        {
+            "stage": "norm_out",
+            "epochs": 1,
+            "learning_rate": 1e-5,
+        }
+    )
+    path.write_text(json.dumps(value), encoding="utf-8")
+    with pytest.raises(ValueError, match="does not authorize norm_out"):
         load_stage_a_run_plan(path)
