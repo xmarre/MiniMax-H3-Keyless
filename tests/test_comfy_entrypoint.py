@@ -94,10 +94,11 @@ def test_progressive_snapshot_loader_uses_fresh_pinned_teacher_and_streaming_rel
             return self
 
     diffusion = FakeDiffusion()
+    patcher = SimpleNamespace(size=123)
 
     def fake_teacher(path):
         calls["teacher_path"] = path
-        return SimpleNamespace(patcher="snapshot-model", diffusion_model=diffusion)
+        return SimpleNamespace(patcher=patcher, diffusion_model=diffusion)
 
     monkeypatch.setattr(module, "load_pinned_bf16_teacher", fake_teacher)
 
@@ -119,7 +120,8 @@ def test_progressive_snapshot_loader_uses_fresh_pinned_teacher_and_streaming_rel
         "  /artifacts/sweep.prefix-10.json  ",
     )
 
-    assert output == ("snapshot-model",)
+    assert output == (patcher,)
+    assert patcher.size == 0
     assert calls["prefix_manifest_path"] == "/artifacts/sweep.prefix-10.json"
     assert calls["category"] == "diffusion_models"
     assert calls["model_name"] == "teacher.safetensors"
