@@ -33,6 +33,21 @@ def main() -> int:
         ),
     )
     parser.add_argument("--device", required=True, help="Explicit torch device, e.g. cuda:0")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue from the existing mutable epoch checkpoint. Without this flag an "
+            "existing recovery checkpoint is an error rather than being overwritten."
+        ),
+    )
+    parser.add_argument(
+        "--resume-path",
+        help=(
+            "Optional crash-recovery checkpoint path. By default the campaign uses "
+            "<output-dir>/<sweep>.blockNN.training-resume.pt."
+        ),
+    )
     args = parser.parse_args()
 
     inputs = load_progressive_block_run_inputs(
@@ -48,6 +63,8 @@ def main() -> int:
         teacher_path=args.teacher,
         artifact_dir=args.output_dir,
         device=args.device,
+        resume=args.resume,
+        resume_path=args.resume_path,
     )
 
     print(f"Progressive block: {outcome.block_index}")
