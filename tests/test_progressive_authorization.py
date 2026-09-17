@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -47,7 +48,11 @@ def _dataset():
 def _gate():
     return {
         "schema": GATE_SCHEMA,
-        "thresholds": {"fixture_threshold": 1.0},
+        "thresholds": {
+            "fixture_threshold": 1.0,
+            "progressive_fold_atol": 0.002,
+            "progressive_fold_rtol": 0.003,
+        },
         "calibration_evidence": {"fixture": "authorization"},
     }
 
@@ -104,6 +109,29 @@ def test_progressive_authorization_requires_passed_stage_a_and_binds_fixed_input
     assert authorization.prefix.stage_a_campaign_sha256 == evidence.sha256
     assert authorization.prefix.dataset_manifest_sha256 == dataset_sha
     assert authorization.prefix.gate_manifest_sha256 == gate_sha
+
+
+def test_progressive_authorization_rejects_incomplete_stage_b_execution_policy(monkeypatch) -> None:
+    dataset = _dataset()
+    gate = _gate()
+    del gate["thresholds"]["progressive_fold_rtol"]
+    called = False
+
+    def forbidden_stage_a(*args, **kwargs):
+        nonlocal called
+        called = True
+        raise AssertionError("incomplete Stage-B policy must fail before Stage-A evidence I/O")
+
+    monkeypatch.setattr(authorization_module, "load_stage_a_campaign_evidence", forbidden_stage_a)
+    with pytest.raises(ValueError, match="progressive execution thresholds"):
+        authorize_progressive_sweep(
+            "stage-a.json",
+            dataset_manifest=dataset,
+            gate_manifest=gate,
+            sweep_id="core50-001",
+            code_commit="a" * 40,
+        )
+    assert called is False
 
 
 def test_progressive_authorization_rejects_stage_a_dataset_identity_mismatch(monkeypatch) -> None:
