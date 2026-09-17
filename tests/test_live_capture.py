@@ -19,6 +19,10 @@ from minimax_h3_keyless.live_capture import (
     runtime_video_sigma,
 )
 from minimax_h3_keyless.pilot_campaign import DATASET_SCHEMA
+from minimax_h3_keyless.stage_a_execution_binding import (
+    WORKFLOW_CONTEXT_KEY,
+    canonical_stage_a_workflow_prompt_sha256,
+)
 
 
 def _spec(tmp_path: Path, *, sigma=0.5) -> StageACaptureSpec:
@@ -30,6 +34,7 @@ def _spec(tmp_path: Path, *, sigma=0.5) -> StageACaptureSpec:
         target_sigma=sigma,
         output_path=str(tmp_path / "case-a.capture.pt"),
         max_capture_bytes=1024 * 1024,
+        workflow_prompt_sha256="b" * 64,
         sigma_tolerance=1e-6,
     )
 
@@ -112,6 +117,7 @@ def test_target_capture_strips_only_its_wrapper_and_persists_once(tmp_path: Path
             assert kwargs["sigma"] == pytest.approx(0.5)
             assert kwargs["block_indices"] == live_capture.PILOT_BLOCKS
             assert kwargs["context"]["stage_a_observed_video_sigma"] == pytest.approx(0.5)
+            assert kwargs["context"][WORKFLOW_CONTEXT_KEY] == "b" * 64
 
         def __enter__(self):
             return captured
@@ -201,7 +207,25 @@ def test_non_target_sigma_passes_through_without_capture(tmp_path: Path, monkeyp
     assert controller.captured is False
 
 
-def _dataset_manifest() -> dict:
+def _workflow_prompt() -> dict:
+    return {
+        "2": {"class_type": "MiniMaxH3StageATeacherLoader", "inputs": {"model_name": "h3.safetensors"}},
+        "20": {
+            "class_type": "MiniMaxH3StageACapture",
+            "inputs": {
+                "model": ["2", 0],
+                "dataset_manifest_path": "/tmp/dataset.json",
+                "case_id": "case-14",
+                "target_sigma": 0.625,
+                "output_subdir": "captures/stage-a",
+                "max_capture_mib": 64,
+                "sigma_tolerance": 1e-6,
+            },
+        },
+    }
+
+
+def _dataset_manifest(workflow_sha: str) -> dict:
     sigmas = [0.0, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1.0]
     cases = []
     coverage = ["short", "long", "reference", "audio", "mixed-grid"]
@@ -219,15 +243,23 @@ def _dataset_manifest() -> dict:
                 "sigmas": sigmas,
                 "coverage_tags": coverage if index == 0 else [],
                 "assets": [],
+                "workflow_prompt_sha256": workflow_sha,
             }
         )
     return {"schema": DATASET_SCHEMA, "cases": cases}
 
 
-def test_capture_spec_is_bound_to_validated_manifest_case_and_sigma(tmp_path: Path) -> None:
+def test_capture_spec_is_bound_to_validated_manifest_case_sigma_and_workflow(tmp_path: Path) -> None:
+    prompt = _workflow_prompt()
+    workflow_sha = canonical_stage_a_workflow_prompt_sha256(prompt, capture_node_id="20")
     manifest_path = tmp_path / "dataset.json"
-    manifest_path.write_text(json.dumps(_dataset_manifest()), encoding="utf-8")
+    manifest_path.write_text(json.dumps(_dataset_manifest(workflow_sha)), encoding="utf-8")
     output_root = tmp_path / "output"
+    common = {
+        "workflow_prompt": prompt,
+        "capture_node_id": "20",
+        "asset_path_resolver": None,
+    }
     spec = build_stage_a_capture_spec(
         manifest_path,
         case_id="case-14",
@@ -235,10 +267,12 @@ def test_capture_spec_is_bound_to_validated_manifest_case_and_sigma(tmp_path: Pa
         output_root=output_root,
         output_subdir="captures/stage-a",
         max_capture_mib=64,
+        **common,
     )
     assert spec.split == "holdout"
     assert spec.modality_label == "video_audio"
     assert spec.target_sigma == pytest.approx(0.625)
+    assert spec.workflow_prompt_sha256 == workflow_sha
     assert Path(spec.output_path).parent == (output_root / "captures/stage-a").resolve()
     assert spec.max_capture_bytes == 64 * 1024 * 1024
 
@@ -248,6 +282,7 @@ def test_capture_spec_is_bound_to_validated_manifest_case_and_sigma(tmp_path: Pa
             case_id="case-14",
             target_sigma=0.3,
             output_root=output_root,
+            **common,
         )
     with pytest.raises(ValueError, match="output_subdir"):
         build_stage_a_capture_spec(
@@ -256,4 +291,17 @@ def test_capture_spec_is_bound_to_validated_manifest_case_and_sigma(tmp_path: Pa
             target_sigma=0.625,
             output_root=output_root,
             output_subdir="../escape",
+            **common,
+        )
+    with pytest.raises(ValueError, match="executed Comfy API prompt does not match"):
+        changed = json.loads(json.dumps(prompt))
+        changed["2"]["inputs"]["model_name"] = "other.safetensors"
+        build_stage_a_capture_spec(
+            manifest_path,
+            case_id="case-14",
+            target_sigma=0.625,
+            output_root=output_root,
+            workflow_prompt=changed,
+            capture_node_id="20",
+            asset_path_resolver=None,
         )
