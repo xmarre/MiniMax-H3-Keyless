@@ -12,6 +12,10 @@ from minimax_h3_keyless.capture_registry import build_stage_a_capture_registry
 from minimax_h3_keyless.pilot import PilotCase
 from minimax_h3_keyless.pilot_campaign import DATASET_SCHEMA, write_json_atomic
 from minimax_h3_keyless.pilot_inputs import load_stage_a_capture_registry
+from minimax_h3_keyless.stage_a_execution_binding import WORKFLOW_CONTEXT_KEY
+
+
+WORKFLOW_SHA = "f" * 64
 
 
 def _manifest() -> dict:
@@ -32,12 +36,13 @@ def _manifest() -> dict:
                 "sigmas": [sigma_values[index % len(sigma_values)]],
                 "coverage_tags": tags if index == 0 else [],
                 "assets": [],
+                "workflow_prompt_sha256": WORKFLOW_SHA,
             }
         )
     return {"schema": DATASET_SCHEMA, "cases": cases}
 
 
-def _records(case_id: str, sigma: float, modality: str):
+def _records(case_id: str, sigma: float, modality: str, *, workflow_sha: str = WORKFLOW_SHA):
     base = PilotCase(
         x=torch.arange(8, dtype=torch.float32).reshape(2, 4),
         t_emb=torch.ones(1, 2),
@@ -48,7 +53,11 @@ def _records(case_id: str, sigma: float, modality: str):
         sigma=sigma,
         modality_label=modality,
         position_ids=torch.zeros(2, 3, dtype=torch.float64),
-        context={"stage_a_source_case_id": case_id},
+        context={
+            "stage_a_source_case_id": case_id,
+            "stage_a_split": "train" if int(case_id.split("-")[-1]) < 12 else "holdout",
+            WORKFLOW_CONTEXT_KEY: workflow_sha,
+        },
     )
     return tuple(
         CapturedPilotCase(
@@ -141,4 +150,39 @@ def test_registry_builder_rejects_missing_or_mixed_capture_evidence(tmp_path: Pa
             manifest_path,
             mixed,
             tmp_path / "mixed.json",
+        )
+
+
+def test_registry_builder_rejects_capture_from_wrong_workflow(tmp_path: Path) -> None:
+    manifest = _manifest()
+    manifest_path = tmp_path / "dataset.json"
+    write_json_atomic(manifest_path, manifest)
+    from minimax_h3_keyless.pilot_campaign import validate_pilot_dataset_manifest
+    from minimax_h3_keyless.pilot_inputs import CANONICAL_STAGE_A_COVERAGE_TAGS
+
+    dataset_identity = validate_pilot_dataset_manifest(
+        manifest,
+        required_coverage_tags=CANONICAL_STAGE_A_COVERAGE_TAGS,
+    )
+    receipts = []
+    for case in manifest["cases"]:
+        sigma = float(case["sigmas"][0])
+        workflow_sha = "e" * 64 if case["case_id"] == "case-05" else WORKFLOW_SHA
+        written = write_captured_pilot_bundle(
+            tmp_path / "captures" / f"{case['case_id']}.capture.pt",
+            _records(
+                case["case_id"],
+                sigma,
+                case["modality_label"],
+                workflow_sha=workflow_sha,
+            ),
+            provenance=_provenance(dataset_identity),
+        )
+        receipts.append(Path(written.receipt_path))
+
+    with pytest.raises(ValueError, match="workflow identity"):
+        build_stage_a_capture_registry(
+            manifest_path,
+            receipts,
+            tmp_path / "wrong-workflow.json",
         )

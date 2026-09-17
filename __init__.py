@@ -220,6 +220,7 @@ class MiniMaxH3StageACapture:
                     {"default": 0.000001, "min": 0.0, "max": 0.0001, "step": 0.0000001},
                 ),
             },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
         }
 
     RETURN_TYPES = ("MODEL",)
@@ -227,10 +228,10 @@ class MiniMaxH3StageACapture:
     CATEGORY = "MiniMax H3/Keyless/training"
     DESCRIPTION = (
         "Clone a model loaded by the Stage-A BF16 Teacher Loader and install a one-shot "
-        "native H3 capture at one dataset-declared video sigma. The capture is accepted "
-        "only when this is the sole DIFFUSION_MODEL wrapper and the teacher remains "
-        "unpatched. It writes immutable block 0/25/49 capture evidence under the Comfy "
-        "output directory when the sampler reaches the requested sigma."
+        "native H3 capture at one dataset-declared video sigma. The executed Comfy API "
+        "prompt and declared file-backed asset bytes must match the case's predeclared "
+        "workflow/asset identities. The capture is accepted only when this is the sole "
+        "DIFFUSION_MODEL wrapper and the teacher remains unpatched."
     )
 
     def apply(
@@ -242,6 +243,8 @@ class MiniMaxH3StageACapture:
         output_subdir: str,
         max_capture_mib: int,
         sigma_tolerance: float = 1e-6,
+        prompt=None,
+        unique_id=None,
     ):
         import folder_paths
 
@@ -253,6 +256,9 @@ class MiniMaxH3StageACapture:
             case_id=case_id,
             target_sigma=float(target_sigma),
             output_root=folder_paths.get_output_directory(),
+            workflow_prompt=prompt,
+            capture_node_id=unique_id,
+            asset_path_resolver=folder_paths.get_annotated_filepath,
             output_subdir=output_subdir,
             max_capture_mib=int(max_capture_mib),
             sigma_tolerance=float(sigma_tolerance),
