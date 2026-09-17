@@ -10,7 +10,6 @@ import pytest
 import torch
 
 import minimax_h3_keyless.live_capture as live_capture
-import minimax_h3_keyless.stage_a_bound_capture as bound_capture
 from minimax_h3_keyless.capture_io import CaptureBundleProvenance, CaptureBundleWriteResult
 from minimax_h3_keyless.pilot_campaign import DATASET_SCHEMA
 from minimax_h3_keyless.stage_a_execution_binding import (
@@ -73,7 +72,7 @@ def test_bound_capture_spec_requires_predeclared_executed_workflow(tmp_path: Pat
     manifest_path = tmp_path / "dataset.json"
     manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-    spec = bound_capture.build_stage_a_capture_spec(
+    spec = live_capture.build_stage_a_capture_spec(
         manifest_path,
         case_id="case-14",
         target_sigma=0.625,
@@ -88,7 +87,7 @@ def test_bound_capture_spec_requires_predeclared_executed_workflow(tmp_path: Pat
     assert spec.split == "holdout"
 
     with pytest.raises(ValueError, match="executed Comfy API prompt does not match"):
-        bound_capture.build_stage_a_capture_spec(
+        live_capture.build_stage_a_capture_spec(
             manifest_path,
             case_id="case-14",
             target_sigma=0.625,
@@ -102,7 +101,7 @@ def test_bound_capture_spec_requires_predeclared_executed_workflow(tmp_path: Pat
 
 def test_bound_controller_persists_workflow_identity_in_capture_context(tmp_path: Path, monkeypatch) -> None:
     workflow_sha = "a" * 64
-    spec = bound_capture.StageACaptureSpec(
+    spec = live_capture.StageACaptureSpec(
         dataset_manifest_sha256="b" * 64,
         source_case_id="case-a",
         split="train",
@@ -143,7 +142,7 @@ def test_bound_controller_persists_workflow_identity_in_capture_context(tmp_path
     inner = object()
     patcher = FakePatcher(inner)
     live_capture.mark_pinned_stage_a_teacher(patcher)
-    controller = bound_capture.StageALiveCaptureController(spec, provenance)
+    controller = live_capture.StageALiveCaptureController(spec, provenance)
     controller.bind(patcher, wrapper_type="diffusion_model")
     patcher.wrappers = {
         "diffusion_model": {live_capture.STAGE_A_CAPTURE_WRAPPER_KEY: [controller]}
@@ -163,9 +162,9 @@ def test_bound_controller_persists_workflow_identity_in_capture_context(tmp_path
         def __exit__(self, exc_type, exc, tb):
             return None
 
-    monkeypatch.setattr(bound_capture, "PilotActivationCapture", FakeCapture)
+    monkeypatch.setattr(live_capture, "PilotActivationCapture", FakeCapture)
     monkeypatch.setattr(
-        bound_capture,
+        live_capture,
         "write_captured_pilot_bundle",
         lambda *args, **kwargs: CaptureBundleWriteResult(
             bundle_path=spec.output_path,
