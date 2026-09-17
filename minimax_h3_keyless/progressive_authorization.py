@@ -15,6 +15,7 @@ from .pilot_campaign import (
 )
 from .pilot_inputs import CANONICAL_STAGE_A_COVERAGE_TAGS
 from .progressive import ProgressiveAcceptedBlock, ProgressivePrefix
+from .progressive_gates import progressive_execution_policy_from_gate_manifest
 from .stage_a_campaign_result import StageACampaignEvidence, load_stage_a_campaign_evidence
 
 
@@ -45,7 +46,9 @@ def authorize_progressive_sweep(
     early-to-late core50 sweep. A caller cannot authorize Stage B by constructing a
     ``ProgressivePrefix`` around an unvalidated campaign JSON: the campaign's three block
     artifacts and recomputed gate are validated first, then the supplied fixed dataset and
-    gate policy are required to match the identities embedded in that evidence.
+    gate policy are required to match the identities embedded in that evidence. The gate
+    policy must already contain every Stage-B execution tolerance needed by the sweep; an
+    authorization that could only fail later at the first block is not valid.
     """
 
     if not isinstance(sweep_id, str) or not sweep_id.strip():
@@ -58,6 +61,10 @@ def authorize_progressive_sweep(
         required_coverage_tags=CANONICAL_STAGE_A_COVERAGE_TAGS,
     )
     gate_sha = validate_pilot_gate_manifest(gate_manifest)
+    # Authorization is the earliest Stage-B boundary. Require the full immutable Stage-B
+    # execution policy here rather than creating a prefix that is guaranteed to fail only
+    # after expensive capture/training work begins.
+    progressive_execution_policy_from_gate_manifest(gate_manifest)
     stage_a = load_stage_a_campaign_evidence(
         stage_a_result_path,
         gate_manifest=gate_manifest,
