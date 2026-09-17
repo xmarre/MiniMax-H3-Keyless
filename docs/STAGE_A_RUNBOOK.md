@@ -13,6 +13,8 @@ Prepare these inputs before capturing or training:
 
 The production Stage-A dataset validator requires at least 16 cases, at least 8 distinct sigma strata across the corpus, both `train` and `holdout` cases, and coverage tags `short`, `long`, `reference`, `audio`, and `mixed-grid`. The manifest is an experiment definition, not a convenience list: prompt, seed, schedule, modality, resolution, duration, sigma strata and assets are part of the fixed evidence identity.
 
+Train/holdout isolation is by complete case **and asset content**. Case IDs must be unique. An asset SHA-256 may be reused by multiple cases inside the same split, but the same asset bytes may not appear in both `train` and `holdout`, even under different paths or URIs. This prevents reference/audio/video assets from leaking across the empirical gate under renamed case IDs.
+
 Do not change dataset, gate, or train-plan inputs after seeing pilot outcomes and continue under the same run identity. Use a new experiment/run identity instead.
 
 ## 2. Capture under plain native H3
@@ -97,17 +99,20 @@ The runner requires the claimed `--code-commit` to equal the clean MiniMax-H3-Ke
 
 The runner indexes and hash-validates the full capture corpus without loading all activation tensors. For each pilot depth it materializes only that block's train/holdout records, then releases them when the block run ends. This avoids keeping captures for blocks 0, 25 and 49 resident simultaneously.
 
-For each block, the runner:
+For each block, the Stage-A v3 runner:
 
-1. replays every capture through the frozen native teacher block and proves the recorded post-AdaLN attention input is reproduced within the predeclared tolerance;
-2. evaluates identity route initialization and least-squares route initialization at the fixed lambda-relative grid `0`, `1e-4`, `1e-2` on held-out cases;
-3. selects initialization by held-out attention-output error, with deterministic tie breaking;
-4. trains only the stages present in the fixed train plan, in the monotonic `route -> query -> value -> norm_out` order;
-5. re-evaluates the fixed holdout cases;
-6. applies the predeclared Stage-A numerical gate;
-7. writes hash-bound block result/resume evidence without relabeling a failed gate as success.
+1. replays every train and holdout capture through the frozen native teacher block and proves the recorded post-AdaLN attention input is reproduced within the predeclared tolerance;
+2. derives the regularized-LS route fits from **training captures only**, evaluates identity initialization plus the fixed LS lambda-relative grid `0`, `1e-4`, `1e-2` on complete **training cases**, and records the bounded attention diagnostics for those training cases;
+3. selects the candidate initialization and the best LS lambda from that training evidence only, with deterministic tie breaking;
+4. evaluates the untrained identity baseline and the **train-selected LS baseline** on the untouched complete-case holdout;
+5. trains only the stages present in the fixed train plan, in monotonic `route -> query -> value -> norm_out` order, using training cases only;
+6. evaluates the trained candidate and its attention diagnostics on that same untouched holdout;
+7. applies the predeclared Stage-A numerical gate to the held-out candidate versus the two held-out untrained baselines;
+8. writes hash-bound v3 block result/resume evidence, including `selection_split=train_complete_cases` and the train-selected LS lambda, without relabeling a failed gate as success.
 
 The same-input local objective uses the actual copied H3 block. Non-attention block weights remain frozen. The native teacher block executes under `no_grad`; the Keyless student receives the same block input and must reproduce the same post-AdaLN attention input before its loss is accepted.
+
+The holdout is an exit-gate dataset, not a hyperparameter-selection dataset. Do not inspect it to choose identity versus LS, choose the LS lambda, change loss weights, change the train plan, or tune thresholds under the same experiment identity.
 
 ## 6. Resume an interrupted campaign
 
@@ -119,7 +124,7 @@ python tools/run_stage_a_pilots.py \
   --resume-completed
 ```
 
-A completed block is reused only after its checkpoint/result hashes, experiment context, initialization selection, numerical evidence and recomputed gate validate. A partial checkpoint/result pair is an error. Changing dataset, registry, gate manifest, train-plan identity or capture provenance changes the experiment context and prevents silent reuse.
+A completed block is reused only after its checkpoint/result hashes, experiment context, v3 selection-split marker, initialization selection, train-selected LS lambda, numerical evidence and recomputed gate validate. The v3 loader also requires the initialization rows to describe one training case set and rejects overlap between those training-selection case IDs and the held-out candidate case IDs. A partial checkpoint/result pair is an error. Changing dataset, registry, gate manifest, train-plan identity or capture provenance changes the experiment context and prevents silent reuse.
 
 Trusted-local `torch.save` resume checkpoints contain optimizer/RNG state and are loaded with `weights_only=False`; do not use untrusted resume files.
 
@@ -127,6 +132,6 @@ Trusted-local `torch.save` resume checkpoints contain optimizer/RNG state and ar
 
 A campaign passes Stage A only when the predeclared gate passes for all three prescribed depths: 0, 25 and 49. CPU unit tests and structural CI establish implementation contracts only; they do not establish H3 output parity.
 
-If Stage A fails, retain the immutable evidence and diagnose the failure. Do not loosen gate thresholds after observing the result and do not proceed to the 50-block progressive conversion while calling the failed pilot accepted.
+If Stage A fails, retain the immutable evidence and diagnose the failure. Do not reuse the holdout to pick a different initialization or LS lambda, do not loosen gate thresholds after observing the result, and do not proceed to the 50-block progressive conversion while calling the failed pilot accepted. Any changed dataset, training recipe, architecture escalation, or thresholds require a new experiment identity and fresh evidence.
 
 If Stage A passes, the next design stage is the progressive core50 sweep on live student inputs. That stage must locally compare each frozen original QKV block against the Keyless replacement on the same current hidden input and must retain rollback/checkpoint granularity. The Stage-A capture corpus is not a substitute for that live-input progressive procedure.
