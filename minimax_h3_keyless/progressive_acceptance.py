@@ -13,9 +13,10 @@ from .attention import KeylessAttentionDeploy, KeylessAttentionTrain
 from .checkpoint import sha256_file
 from .export import fold_query_route_weight
 from .pilot import _run_block_capture_attention
-from .pilot_campaign import canonical_json_sha256, validate_pilot_gate_manifest
+from .pilot_campaign import PILOT_LS_LAMBDAS, canonical_json_sha256, validate_pilot_gate_manifest
 from .pilot_gates import stage_a_policy_from_gate_manifest
 from .pilot_replay import pilot_case_to_device
+from .pilot_runner import select_stage_a_initialization
 from .progressive import ProgressivePrefix, validate_progressive_model_prefix
 from .progressive_artifacts import (
     PROGRESSIVE_RESUME_SCHEMA,
@@ -28,6 +29,9 @@ from .progressive_artifacts import (
 from .progressive_capture_set import ProgressiveBlockCaptureSet
 from .progressive_gates import evaluate_progressive_block_gate
 from .progressive_runner import ProgressiveBlockTrainingResult
+
+
+_SELECTION_SPLIT = "train_complete_cases"
 
 
 def fold_progressive_training_block(student_block: nn.Module) -> nn.Module:
@@ -127,6 +131,91 @@ def _verify_fold_equivalence(
         training_block.train(was_training)
 
 
+def _metric_case_ids(metrics) -> tuple[str, ...]:
+    return tuple(row.case_id for row in metrics.cases)
+
+
+def _validate_selection_isolation(
+    result: ProgressiveBlockTrainingResult,
+    captures: ProgressiveBlockCaptureSet,
+) -> None:
+    """Reprove that Stage-B model selection never consumed the exit holdout."""
+    if result.selection_split != _SELECTION_SPLIT:
+        raise RuntimeError(
+            "progressive candidate does not record train-only initialization selection"
+        )
+
+    train_ids = tuple(record.case.case_id for record in captures.records("train"))
+    holdout_ids = tuple(record.case.case_id for record in captures.records("holdout"))
+    if not train_ids or not holdout_ids:
+        raise RuntimeError("progressive selection isolation requires train and holdout captures")
+    overlap = sorted(set(train_ids) & set(holdout_ids))
+    if overlap:
+        raise RuntimeError(
+            f"progressive train/holdout execution IDs overlap: {overlap}"
+        )
+
+    evaluations = result.initialization_evaluations
+    if not evaluations:
+        raise RuntimeError("progressive candidate is missing initialization-selection evidence")
+    for row in evaluations:
+        if _metric_case_ids(row.metrics) != train_ids:
+            raise RuntimeError(
+                "progressive initialization selection was not evaluated on the exact training captures"
+            )
+        if tuple(diag.case_id for diag in row.attention_diagnostics) != train_ids:
+            raise RuntimeError(
+                "progressive initialization diagnostics were not evaluated on the exact training captures"
+            )
+
+    selected = select_stage_a_initialization(evaluations)
+    if (
+        selected.route_mode != result.selected_route_mode
+        or float(selected.lambda_relative) != float(result.selected_lambda_relative)
+    ):
+        raise RuntimeError(
+            "progressive selected initialization does not recompute from training-only evidence"
+        )
+
+    ls_rows = [row for row in evaluations if row.route_mode == "least_squares"]
+    if {float(row.lambda_relative) for row in ls_rows} != set(PILOT_LS_LAMBDAS):
+        raise RuntimeError("progressive training-selection evidence has an invalid LS grid")
+    best_ls = min(
+        ls_rows,
+        key=lambda row: (
+            float(row.metrics.mean_attention_normalized_mse),
+            float(row.metrics.mean_block_normalized_mse),
+            float(row.lambda_relative),
+        ),
+    )
+    if float(result.least_squares_baseline_lambda_relative) != float(best_ls.lambda_relative):
+        raise RuntimeError(
+            "progressive held-out LS baseline does not use the train-selected lambda"
+        )
+
+    for name, metrics in (
+        ("identity baseline", result.identity_baseline),
+        ("least-squares baseline", result.least_squares_baseline),
+        ("candidate", result.candidate),
+    ):
+        if _metric_case_ids(metrics) != holdout_ids:
+            raise RuntimeError(
+                f"progressive {name} was not evaluated on the exact exit holdout captures"
+            )
+    if tuple(diag.case_id for diag in result.candidate_attention_diagnostics) != holdout_ids:
+        raise RuntimeError(
+            "progressive candidate diagnostics were not evaluated on the exact exit holdout captures"
+        )
+
+    event_ids = {event.case_id for event in result.training_events}
+    if not event_ids or event_ids != set(train_ids):
+        raise RuntimeError(
+            "progressive training events do not cover exactly the training-selection executions"
+        )
+    if event_ids & set(holdout_ids):
+        raise RuntimeError("progressive training events contain exit-holdout executions")
+
+
 def _validate_persisted_candidate(
     *,
     prefix: ProgressivePrefix,
@@ -135,6 +224,7 @@ def _validate_persisted_candidate(
     receipt: ProgressiveArtifactReceipt,
     gate_manifest: Mapping[str, object],
 ) -> ProgressiveRunIdentity:
+    _validate_selection_isolation(result, captures)
     expected_identity = progressive_run_identity(prefix, captures, result)
     gate_sha = validate_pilot_gate_manifest(gate_manifest)
     if gate_sha.lower() != prefix.gate_manifest_sha256.lower():
