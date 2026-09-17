@@ -391,7 +391,7 @@ def _validate_resume_progress(
     state: ProgressiveTrainingResumeState,
     plan: Sequence[StageATrainStage],
     *,
-    train_case_count: int,
+    train_case_ids: Sequence[str],
 ) -> None:
     if state.stage_index >= len(plan):
         raise RuntimeError("progressive training resume stage_index exceeds the fixed train plan")
@@ -400,30 +400,36 @@ def _validate_resume_progress(
         raise RuntimeError("progressive training resume stage differs from the fixed train plan")
     if state.completed_epochs > spec.epochs:
         raise RuntimeError("progressive training resume completed_epochs exceeds the fixed stage")
-    if train_case_count <= 0:
-        raise RuntimeError("progressive training resume requires non-empty train cases")
 
-    expected_events = train_case_count * state.completed_epochs
+    case_ids = tuple(train_case_ids)
+    if not case_ids:
+        raise RuntimeError("progressive training resume requires non-empty train cases")
+    if any(not isinstance(case_id, str) or not case_id for case_id in case_ids):
+        raise RuntimeError("progressive training resume train case IDs are invalid")
+
+    expected: list[tuple[str, int, str]] = []
     for prior in plan[: state.stage_index]:
-        expected_events += train_case_count * prior.epochs
-    if len(state.events) != expected_events:
+        for epoch in range(prior.epochs):
+            expected.extend((prior.stage, epoch, case_id) for case_id in case_ids)
+    for epoch in range(state.completed_epochs):
+        expected.extend((state.stage, epoch, case_id) for case_id in case_ids)
+
+    actual = [(row.stage, row.epoch, row.case_id) for row in state.events]
+    if len(actual) != len(expected):
         raise RuntimeError(
             "progressive training resume event count is inconsistent with its stage/epoch progress"
         )
-
-    offset = 0
-    for prior in plan[: state.stage_index]:
-        count = train_case_count * prior.epochs
-        rows = state.events[offset : offset + count]
-        if any(row.stage != prior.stage or not 0 <= row.epoch < prior.epochs for row in rows):
-            raise RuntimeError("progressive training resume prior-stage events are inconsistent")
-        offset += count
-    rows = state.events[offset:]
-    if any(
-        row.stage != state.stage or not 0 <= row.epoch < state.completed_epochs
-        for row in rows
-    ):
-        raise RuntimeError("progressive training resume current-stage events are inconsistent")
+    if actual != expected:
+        mismatch = next(
+            index
+            for index, (actual_row, expected_row) in enumerate(zip(actual, expected))
+            if actual_row != expected_row
+        )
+        raise RuntimeError(
+            "progressive training resume event ordering/content differs from the exact "
+            "capture traversal: "
+            f"index={mismatch}, actual={actual[mismatch]!r}, expected={expected[mismatch]!r}"
+        )
 
 
 def _preflight_resume_request(request: ProgressiveTrainingResumeRequest | None) -> None:
@@ -551,7 +557,7 @@ def run_progressive_block_training(
             _validate_resume_progress(
                 resume_state,
                 plan,
-                train_case_count=len(train_cases),
+                train_case_ids=tuple(record.case.case_id for record in train_records),
             )
 
     events: list[PilotTrainingEvent] = [] if resume_state is None else list(resume_state.events)
