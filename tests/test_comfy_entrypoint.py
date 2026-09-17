@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import pytest
+
 from minimax_h3_keyless.progressive import ProgressivePrefix
 
 
@@ -38,14 +40,156 @@ def _load_entrypoint():
 
 def test_entrypoint_registers_progressive_stage_b_nodes() -> None:
     module = _load_entrypoint()
+    assert module.NODE_CLASS_MAPPINGS["MiniMaxH3ProgressiveSnapshotLoader"] is (
+        module.MiniMaxH3ProgressiveSnapshotLoader
+    )
     assert module.NODE_CLASS_MAPPINGS["MiniMaxH3ProgressiveOverlay"] is module.MiniMaxH3ProgressiveOverlay
     assert module.NODE_CLASS_MAPPINGS["MiniMaxH3ProgressiveCapture"] is module.MiniMaxH3ProgressiveCapture
+    assert module.NODE_DISPLAY_NAME_MAPPINGS["MiniMaxH3ProgressiveSnapshotLoader"] == (
+        "MiniMax H3 Progressive Snapshot Loader"
+    )
     assert module.NODE_DISPLAY_NAME_MAPPINGS["MiniMaxH3ProgressiveOverlay"] == (
         "MiniMax H3 Progressive Prefix Overlay"
     )
     assert module.NODE_DISPLAY_NAME_MAPPINGS["MiniMaxH3ProgressiveCapture"] == (
         "MiniMax H3 Progressive Capture"
     )
+
+
+def test_progressive_snapshot_loader_uses_fresh_pinned_teacher_and_streaming_reload(
+    monkeypatch,
+) -> None:
+    module = _load_entrypoint()
+    prefix = ProgressivePrefix(
+        sweep_id="snapshot-node-test",
+        code_commit="e" * 40,
+        stage_a_campaign_sha256="a" * 64,
+        dataset_manifest_sha256="b" * 64,
+        gate_manifest_sha256="c" * 64,
+    )
+    prefix_manifest_sha = "f" * 64
+    calls = {}
+
+    folder_paths = ModuleType("folder_paths")
+    folder_paths.get_full_path_or_raise = lambda category, name: (
+        calls.update(category=category, model_name=name) or "/models/teacher.safetensors"
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", folder_paths)
+    monkeypatch.setattr(
+        module,
+        "load_progressive_prefix_manifest",
+        lambda path: (
+            calls.update(prefix_manifest_path=path) or (prefix, prefix_manifest_sha)
+        ),
+    )
+    monkeypatch.setattr(
+        module,
+        "discover_clean_git_revision",
+        lambda path, *, label: "e" * 40,
+    )
+
+    class FakeDiffusion:
+        def to(self, device):
+            calls["moved_to"] = str(device)
+            return self
+
+    diffusion = FakeDiffusion()
+
+    def fake_teacher(path):
+        calls["teacher_path"] = path
+        return SimpleNamespace(patcher="snapshot-model", diffusion_model=diffusion)
+
+    monkeypatch.setattr(module, "load_pinned_bf16_teacher", fake_teacher)
+
+    def fake_stream(model, snapshot_path, supplied_prefix, **kwargs):
+        calls.update(
+            stream_model=model,
+            snapshot_path=snapshot_path,
+            stream_prefix=supplied_prefix,
+            stream_kwargs=kwargs,
+        )
+        return model
+
+    monkeypatch.setattr(module, "load_progressive_snapshot_streaming", fake_stream)
+
+    output = module.MiniMaxH3ProgressiveSnapshotLoader().load(
+        "teacher.safetensors",
+        "  /snapshots/prefix-10.safetensors  ",
+        "  /snapshots/prefix-10.safetensors.manifest.json  ",
+        "  /artifacts/sweep.prefix-10.json  ",
+    )
+
+    assert output == ("snapshot-model",)
+    assert calls["prefix_manifest_path"] == "/artifacts/sweep.prefix-10.json"
+    assert calls["category"] == "diffusion_models"
+    assert calls["model_name"] == "teacher.safetensors"
+    assert calls["teacher_path"] == "/models/teacher.safetensors"
+    assert calls["moved_to"] == "cpu"
+    assert calls["stream_model"] is diffusion
+    assert calls["snapshot_path"] == "/snapshots/prefix-10.safetensors"
+    assert calls["stream_prefix"] is prefix
+    assert calls["stream_kwargs"] == {
+        "prefix_manifest_sha256": prefix_manifest_sha,
+        "manifest_path": "/snapshots/prefix-10.safetensors.manifest.json",
+    }
+
+
+def test_progressive_snapshot_loader_rejects_source_drift_before_loading_teacher(
+    monkeypatch,
+) -> None:
+    module = _load_entrypoint()
+    prefix = ProgressivePrefix(
+        sweep_id="snapshot-node-drift",
+        code_commit="e" * 40,
+        stage_a_campaign_sha256="a" * 64,
+        dataset_manifest_sha256="b" * 64,
+        gate_manifest_sha256="c" * 64,
+    )
+
+    folder_paths = ModuleType("folder_paths")
+    folder_paths.get_full_path_or_raise = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("teacher path must not be resolved after source drift")
+    )
+    monkeypatch.setitem(sys.modules, "folder_paths", folder_paths)
+    monkeypatch.setattr(
+        module,
+        "load_progressive_prefix_manifest",
+        lambda path: (prefix, "f" * 64),
+    )
+    monkeypatch.setattr(
+        module,
+        "discover_clean_git_revision",
+        lambda path, *, label: "d" * 40,
+    )
+    monkeypatch.setattr(
+        module,
+        "load_pinned_bf16_teacher",
+        lambda path: (_ for _ in ()).throw(
+            AssertionError("teacher must not be loaded after source drift")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="source revision differs"):
+        module.MiniMaxH3ProgressiveSnapshotLoader().load(
+            "teacher.safetensors",
+            "/snapshots/prefix.safetensors",
+            "/snapshots/prefix.safetensors.manifest.json",
+            "/artifacts/prefix.json",
+        )
+
+
+def test_progressive_snapshot_loader_rejects_empty_artifact_paths(monkeypatch) -> None:
+    module = _load_entrypoint()
+    folder_paths = ModuleType("folder_paths")
+    monkeypatch.setitem(sys.modules, "folder_paths", folder_paths)
+
+    with pytest.raises(ValueError, match="paths must be non-empty"):
+        module.MiniMaxH3ProgressiveSnapshotLoader().load(
+            "teacher.safetensors",
+            " ",
+            "/snapshots/prefix.safetensors.manifest.json",
+            "/artifacts/prefix.json",
+        )
 
 
 def test_progressive_overlay_node_uses_clean_plugin_revision_and_optional_artifact_root(
