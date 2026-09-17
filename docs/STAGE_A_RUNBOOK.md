@@ -26,7 +26,9 @@ python tools/hash_stage_a_workflow_prompt.py /path/to/case.api.json \
 
 If the API prompt contains exactly one `MiniMaxH3StageACapture`, `--capture-node-id` may be omitted. Store the printed digest as that manifest case's `workflow_prompt_sha256`. Capture destinations and observed sigma strata may then change through the normalized Stage-A bookkeeping fields without changing the semantic workflow identity.
 
-Every manifest asset used for canonical Stage A must be file-backed and named by the same `path_or_uri` literal that appears in the executed API prompt. At node execution, Comfy resolves that literal with its normal annotated-file path resolver and MiniMax-H3-Keyless hashes the resolved bytes. The resulting SHA-256 must equal the manifest asset hash. Remote/dynamic assets that cannot be resolved to an immutable local file are not accepted as canonical Stage-A evidence; materialize them first and record the resulting file/hash in the fixed manifest.
+Every manifest asset used for canonical Stage A must be file-backed and named by the same `path_or_uri` literal that appears on the static API subgraph connected to the active Stage-A capture node. At node execution, Comfy resolves that literal with its normal annotated-file path resolver and MiniMax-H3-Keyless hashes the resolved bytes. The resulting SHA-256 must equal the manifest asset hash. A matching literal on an unrelated/dead graph branch does not satisfy the binding. Remote/dynamic assets that cannot be resolved to an immutable local file are not accepted as canonical Stage-A evidence; materialize them first and record the resulting file/hash in the fixed manifest.
+
+Canonical Stage-A v3 train plans may contain `route`, optional `query`, and optional `value`, in that order. They **must not** contain `norm_out`. The lower-level training code retains a `norm_out` freeze schedule for a future evidence schema, but canonical v3 deliberately refuses to train copied `q_norm`/`out_proj` merely because a fixed plan listed them. The authoritative design allows that escalation only after V has been unfrozen and a separate held-out block signal has actually plateaued. No such train-only escalation decision exists in v3, and the exit holdout is not permitted to supply it.
 
 Do not change dataset, workflow graph, assets, gate, or train-plan inputs after seeing pilot outcomes and continue under the same run identity. Use a new experiment/run identity instead.
 
@@ -42,7 +44,7 @@ Route its `MODEL` output through **MiniMax H3 Stage-A Capture** before the norma
 - `output_subdir`: a relative path below the Comfy output directory;
 - `max_capture_mib`: an explicit per-forward CPU capture budget.
 
-The node receives Comfy's hidden `PROMPT` and `UNIQUE_ID` execution inputs. Before it installs any capture wrapper it canonicalizes the **executed** API prompt, compares its hash with the case's fixed `workflow_prompt_sha256`, verifies every declared asset literal against the resolved file bytes, and fails closed on any mismatch. A valid case ID by itself is not sufficient evidence that the requested prompt/seed/assets/geometry were actually executed.
+The node receives Comfy's hidden `PROMPT` and `UNIQUE_ID` execution inputs. Before it installs any capture wrapper it canonicalizes the **executed** API prompt, compares its hash with the case's fixed `workflow_prompt_sha256`, verifies every declared asset literal on the capture-connected static graph against the resolved file bytes, and fails closed on any mismatch. A valid case ID by itself is not sufficient evidence that the requested prompt/seed/assets/geometry were actually executed.
 
 The workflow still owns the generation inputs; the capture node does not synthesize prompt, seed, schedule, media/reference inputs, duration or resolution from the manifest. Instead, the workflow hash binds the complete API graph representing those choices, while live capture separately binds the observed H3 sigma and the actual block/attention inputs produced by that execution.
 
@@ -55,7 +57,7 @@ A Stage-A capture is rejected rather than silently accepted when any of the foll
 - the model did not originate from the strict Stage-A BF16 teacher loader;
 - the live native H3 topology no longer matches the pinned teacher contract;
 - the executed Comfy API prompt does not match the case's predeclared `workflow_prompt_sha256`;
-- a declared asset is absent from the API prompt, cannot be resolved as a local Comfy file, or its bytes do not match the manifest SHA-256;
+- a declared asset is absent from the capture-connected static API graph, cannot be resolved as a local Comfy file, or its bytes do not match the manifest SHA-256;
 - model patches, object patches, weight wrappers, injections, hooks or callbacks are active;
 - another `DIFFUSION_MODEL` wrapper is installed;
 - a Keyless provider or optimized-attention override is active;
@@ -124,14 +126,16 @@ For each block, the Stage-A v3 runner:
 2. derives the regularized-LS route fits from **training captures only**, evaluates identity initialization plus the fixed LS lambda-relative grid `0`, `1e-4`, `1e-2` on complete **training cases**, and records the bounded attention diagnostics for those training cases;
 3. selects the candidate initialization and the best LS lambda from that training evidence only, with deterministic tie breaking;
 4. evaluates the untrained identity baseline and the **train-selected LS baseline** on the untouched complete-case holdout;
-5. trains only the stages present in the fixed train plan, in monotonic `route -> query -> value -> norm_out` order, using training cases only;
+5. trains only the stages present in the fixed train plan, in monotonic `route -> query -> value` order, using training cases only; canonical v3 rejects `norm_out` rather than unconditionally unfreezing copied `q_norm`/`out_proj`;
 6. evaluates the trained candidate and its attention diagnostics on that same untouched holdout;
 7. applies the predeclared Stage-A numerical gate to the held-out candidate versus the two held-out untrained baselines;
 8. writes hash-bound v3 block result/resume evidence, including `selection_split=train_complete_cases` and the train-selected LS lambda, without relabeling a failed gate as success.
 
 The same-input local objective uses the actual copied H3 block. Non-attention block weights remain frozen. The native teacher block executes under `no_grad`; the Keyless student receives the same block input and must reproduce the same post-AdaLN attention input before its loss is accepted.
 
-The holdout is an exit-gate dataset, not a hyperparameter-selection dataset. Do not inspect it to choose identity versus LS, choose the LS lambda, change loss weights, change the train plan, or tune thresholds under the same experiment identity.
+The holdout is an exit-gate dataset, not a hyperparameter-selection or architecture-escalation dataset. Do not inspect it to choose identity versus LS, choose the LS lambda, decide whether to unfreeze `q_norm`/`out_proj`, change loss weights, change the train plan, or tune thresholds under the same experiment identity.
+
+If a value-unfrozen candidate later shows a genuine plateau that justifies considering `q_norm`/`out_proj`, do not append `norm_out` to the current v3 plan. Introduce a new, predeclared evidence schema with a dedicated train-only calibration partition (complete cases and asset-isolated from the fit subset), a frozen plateau/target rule, and a new experiment identity. The exit holdout must remain untouched until the final gate. Until that contract exists, v3 fails closed on `norm_out`.
 
 ## 6. Resume an interrupted campaign
 
@@ -151,6 +155,6 @@ Trusted-local `torch.save` resume checkpoints contain optimizer/RNG state and ar
 
 A campaign passes Stage A only when the predeclared gate passes for all three prescribed depths: 0, 25 and 49. CPU unit tests and structural CI establish implementation contracts only; they do not establish H3 output parity.
 
-If Stage A fails, retain the immutable evidence and diagnose the failure. Do not reuse the holdout to pick a different initialization or LS lambda, do not loosen gate thresholds after observing the result, and do not proceed to the 50-block progressive conversion while calling the failed pilot accepted. Any changed dataset, training recipe, architecture escalation, or thresholds require a new experiment identity and fresh evidence.
+If Stage A fails, retain the immutable evidence and diagnose the failure. Do not reuse the holdout to pick a different initialization or LS lambda, decide on `norm_out`, loosen gate thresholds after observing the result, or proceed to the 50-block progressive conversion while calling the failed pilot accepted. Any changed dataset, training recipe, architecture escalation, or thresholds require a new experiment identity and fresh evidence. A future `norm_out` experiment also requires its own train-only calibration partition/policy; the failed v3 exit holdout cannot be repurposed as that selector.
 
 If Stage A passes, the next design stage is the progressive core50 sweep on live student inputs. That stage must locally compare each frozen original QKV block against the Keyless replacement on the same current hidden input and must retain rollback/checkpoint granularity. The Stage-A capture corpus is not a substitute for that live-input progressive procedure.
