@@ -121,7 +121,7 @@ def _dataset_manifest() -> dict:
                 "sigmas": [j / 7 for j in range(8)],
                 "coverage_tags": ["native", "low" if i < 8 else "high"],
                 "assets": [] if i % 2 == 0 else [
-                    {"path_or_uri": "asset.wav", "sha256": "1" * 64}
+                    {"path_or_uri": f"asset-{i}.wav", "sha256": f"{i + 1:064x}"}
                 ],
             }
         )
@@ -157,6 +157,23 @@ def test_dataset_manifest_freezes_complete_case_split_and_sigma_coverage() -> No
         case["split"] = "train"
     with pytest.raises(ValueError, match="train and holdout"):
         validate_pilot_dataset_manifest(bad)
+
+
+def test_dataset_manifest_rejects_asset_identity_across_train_and_holdout() -> None:
+    manifest = _dataset_manifest()
+    train_asset = manifest["cases"][1]["assets"][0]
+    holdout_asset = manifest["cases"][13]["assets"][0]
+    holdout_asset["sha256"] = train_asset["sha256"]
+    holdout_asset["path_or_uri"] = "different-path-same-content.wav"
+
+    with pytest.raises(ValueError, match="asset crosses train/holdout split"):
+        validate_pilot_dataset_manifest(manifest)
+
+
+def test_dataset_manifest_allows_asset_reuse_within_one_split() -> None:
+    manifest = _dataset_manifest()
+    manifest["cases"][3]["assets"][0]["sha256"] = manifest["cases"][1]["assets"][0]["sha256"]
+    validate_pilot_dataset_manifest(manifest)
 
 
 def test_gate_manifest_requires_predeclared_thresholds_and_calibration() -> None:
