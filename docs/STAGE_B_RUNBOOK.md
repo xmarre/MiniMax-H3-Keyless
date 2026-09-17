@@ -106,11 +106,11 @@ The default recovery path is:
 <output-dir>/<sweep-id>.blockNN.training-resume.pt
 ```
 
-A fresh run refuses to overwrite an existing recovery checkpoint. After interruption, rerun the exact same command with `--resume`; all prefix-manifest, capture-registry, train-plan, selected-initialization and source identities must still match. An alternate scratch path may be declared explicitly with `--resume-path`. Recovery resumes only from completed epochs. If interruption happens partway through an epoch, that epoch is replayed from the preceding completed-epoch checkpoint rather than treating a partial optimizer sequence as complete evidence.
+A fresh run refuses to overwrite an existing recovery checkpoint. After interruption, rerun the exact same command with `--resume`; all prefix-manifest, capture-registry, train-plan, selected-initialization and source identities must still match. An alternate scratch path may be declared explicitly with `--resume-path`. Recovery resumes only from completed epochs. If interruption happens partway through an epoch, that epoch is replayed from the preceding completed-epoch checkpoint rather than treating a partial optimizer sequence as complete evidence. Resume validation also requires the stored `(stage, epoch, case_id)` event sequence to match the exact current capture traversal; an event list with the right count but different order or case identity is rejected.
 
 A failed numerical gate returns exit code `2`. Its candidate artifacts remain immutable evidence, but the current prefix manifest and live accepted model are unchanged. A fold/parity/publication failure raises and the live target block is restored; persisted candidate evidence still does not become accepted without the next prefix manifest.
 
-## 6. Export periodic folded BF16 snapshots
+## 6. Export and run periodic folded BF16 snapshots
 
 The authoritative design requires a second Stage-B checkpoint form in addition to q/R/v training recovery: a deployable folded BF16 snapshot for periodic full-model testing. Do not create one implicitly after every block; choose the testing points before or during the fixed experimental procedure according to the intended full-model validation cadence, because each snapshot is a full H3 checkpoint.
 
@@ -138,7 +138,9 @@ python tools/verify_progressive_snapshot.py \
   --prefix-manifest /path/to/progressive_artifacts/keyless-core50-001.prefix-10.json
 ```
 
-That verifier establishes structural topology/state reload only. The required periodic full-denoiser comparison still has to execute the reloaded model on the fixed validation suite; successful serialization/reload is not numerical or media parity evidence.
+The verifier uses bounded tensor-at-a-time safetensors reads after validating the complete key/shape/dtype map, rather than materializing another full snapshot state dict beside the H3 model. The same path is exposed in ComfyUI as **MiniMax H3 Progressive Snapshot Loader**. Supply the pinned teacher model, snapshot, snapshot receipt and prefix manifest; the node reconstructs the exact accepted-QV/native-QKV topology in a fresh teacher and invalidates Comfy's cached model-size value so subsequent scheduling measures the smaller reconstructed module tree.
+
+Both the CLI verifier and Comfy node establish structural topology/state reload only. The required periodic full-denoiser comparison still has to execute the reloaded model on the fixed validation suite; successful serialization/reload is not numerical or media parity evidence.
 
 ## 7. Advance early-to-late
 
@@ -148,8 +150,24 @@ Continue strictly in order until the accepted prefix contains blocks `0..49`. Ne
 
 If a candidate fails, diagnose it under a new experiment/artifact identity. The current artifact naming intentionally refuses overwrite; do not delete or replace failed evidence merely to rerun different hyperparameters under the same identity. A changed train plan or gate policy is a new experiment and requires matching authorization rather than silent continuation.
 
-## 8. Stage-B exit and remaining gates
+## 8. Stage-B exit and canonical BF16 handoff
 
 Structural unit tests establish serialization, provenance, rollback, lazy-memory, crash-recovery, mixed-snapshot and orchestration contracts. They do not establish that H3 outputs remain visually/audibly acceptable.
 
-Phase 4 exits only after all 50 core blocks have been empirically accepted under the fixed sweep and the required periodic full-model checks have been run. The deploy form contains QV plus the folded route; the training-only `query_route` must not remain in deployable artifacts. Final canonical BF16 export, generation-level validation, INT8 ConvRot export/validation, native/SOL/VDN/Flow interoperability and measured performance remain later phases of the authoritative design.
+Phase 4 exits only after all 50 core blocks have been empirically accepted under the fixed sweep and the required periodic full-model checks have been run. The deploy form contains QV plus the folded route; the training-only `query_route` must not remain in deployable artifacts. Generation-level validation, ecosystem reference compatibility, INT8 ConvRot validation and measured performance remain later phases of the authoritative design.
+
+The canonical all-Keyless BF16 **format/export path** is already available so a completed `prefix-50` can be handed into the later full-model and deployment phases without inventing an aggregate q/R/v checkpoint:
+
+```bash
+python tools/export_progressive_bf16.py \
+  --teacher /path/to/pinned_bf16_teacher.safetensors \
+  --prefix-manifest /path/to/progressive_artifacts/keyless-core50-001.prefix-50.json \
+  --artifact-dir /path/to/progressive_artifacts \
+  --output /path/to/keyless-core50-bf16.safetensors
+```
+
+This command rejects an incomplete prefix, reconstructs all 50 accepted blocks from their immutable checkpoint/result hashes on CPU, exports their already-folded QV state directly as canonical `h3_keyless_core50_v1`, refuses to replace an existing artifact/receipt pair, and reopens the written bytes for both strict deploy validation and pinned-teacher compatibility validation. It records the completed prefix payload and prefix-manifest SHA-256 in the export receipt.
+
+The Stage-B training revision and canonical export revision are separate provenance facts: the prefix retains the frozen training/capture `code_commit`, while the clean source revision that performs export is recorded as `export_commit`. Export hardening after a sweep therefore does not rewrite the training identity.
+
+Producing this canonical-format file does **not** mean the BF16 model passed Phase 5, ecosystem gates, or release gates. Do not feed it into production INT8/release claims until the required fixed full-denoiser and decoded-media evidence has passed.
