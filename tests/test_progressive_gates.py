@@ -10,7 +10,10 @@ from minimax_h3_keyless.pilot_campaign import (
     PilotTrainingEvent,
 )
 from minimax_h3_keyless.pilot_gates import stage_a_policy_from_gate_manifest
-from minimax_h3_keyless.progressive_gates import evaluate_progressive_block_gate
+from minimax_h3_keyless.progressive_gates import (
+    evaluate_progressive_block_gate,
+    progressive_execution_policy_from_gate_manifest,
+)
 
 
 def _manifest():
@@ -29,6 +32,8 @@ def _manifest():
             "stage_a_minimum_block_cosine": 0.88,
             "stage_a_max_modality_nmse_ratio_to_best_baseline": 0.9,
             "stage_a_max_gradient_l2_norm": 50.0,
+            "progressive_fold_atol": 0.002,
+            "progressive_fold_rtol": 0.003,
         },
         "calibration_evidence": {"fixed_suite_sha256": "a" * 64},
     }
@@ -87,6 +92,24 @@ def _events():
             ),
         ),
     )
+
+
+def test_progressive_execution_policy_is_loaded_from_hash_bound_gate_manifest() -> None:
+    policy = progressive_execution_policy_from_gate_manifest(_manifest())
+    assert policy.fold_atol == 0.002
+    assert policy.fold_rtol == 0.003
+
+
+def test_progressive_execution_policy_requires_predeclared_nonnegative_tolerances() -> None:
+    manifest = _manifest()
+    del manifest["thresholds"]["progressive_fold_rtol"]
+    with pytest.raises(ValueError, match="missing progressive execution thresholds"):
+        progressive_execution_policy_from_gate_manifest(manifest)
+
+    manifest = _manifest()
+    manifest["thresholds"]["progressive_fold_atol"] = -1.0
+    with pytest.raises(ValueError, match="finite non-negative"):
+        progressive_execution_policy_from_gate_manifest(manifest)
 
 
 def test_progressive_gate_reuses_pilot_policy_for_nonpilot_depth() -> None:
