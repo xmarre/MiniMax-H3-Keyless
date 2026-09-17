@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass
+from itertools import chain
 from typing import Callable, Mapping, Sequence
 
 import torch
@@ -30,7 +32,7 @@ from .pilot_runner import (
     validate_stage_a_train_plan,
 )
 from .progressive import PROGRESSIVE_PREFIX_CONTEXT_KEY, ProgressivePrefix
-from .progressive_capture_set import ProgressiveBlockCaptureSet
+from .progressive_capture_set import ProgressiveCaptureSet
 from .progressive_gates import ProgressiveBlockGateResult, evaluate_progressive_block_gate
 from .route_fit import (
     RouteActivationFit,
@@ -164,7 +166,7 @@ def _validate_record_binding(
 
 
 def _validate_capture_context(
-    captures: ProgressiveBlockCaptureSet,
+    captures: ProgressiveCaptureSet,
     prefix: ProgressivePrefix,
 ) -> int:
     target = prefix.next_block
@@ -200,8 +202,26 @@ def _validate_capture_context(
     return target
 
 
+class _DeviceCaseSequence(SequenceABC):
+    """Move exactly one capture case to the training device on demand."""
+
+    def __init__(self, records, device: torch.device) -> None:
+        self._records = records
+        self._device = device
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[position] for position in range(*index.indices(len(self))))
+        return pilot_case_to_device(self._records[index].case, self._device)
+
+
 def _move_cases(records, device: torch.device):
-    return tuple(pilot_case_to_device(record.case, device) for record in records)
+    # A lazy Sequence is intentional. Materializing all cases on CUDA defeats the bounded
+    # capture-corpus contract even when the CPU records themselves are lazy.
+    return _DeviceCaseSequence(records, device)
 
 
 def _install_route_fit(student: nn.Module, fit: RouteActivationFit) -> None:
@@ -331,7 +351,7 @@ def _evaluate_initializations(
 
 def run_progressive_block_training(
     teacher_block: nn.Module,
-    captures: ProgressiveBlockCaptureSet,
+    captures: ProgressiveCaptureSet,
     prefix: ProgressivePrefix,
     *,
     device: str | torch.device,
@@ -349,6 +369,8 @@ def run_progressive_block_training(
     Captures must come from the current partially converted model under ``prefix``. The
     frozen original QKV block is replayed on those exact inputs and must reproduce the
     recorded post-AdaLN execution point before route fitting or optimization begins.
+    Lazy capture sets and case sequences are consumed one artifact at a time so production
+    training does not retain the complete target-block corpus in CPU or GPU memory.
     The returned Keyless block is only a candidate; callers must persist and explicitly
     accept it after ``result.gate.passed`` before replacing the live model block.
     """
@@ -379,7 +401,7 @@ def run_progressive_block_training(
             same_input_atol=same_input_atol,
             same_input_rtol=same_input_rtol,
         )
-        for record in (*train_records, *holdout_records)
+        for record in chain(train_records, holdout_records)
     )
 
     route_statistics = collect_route_activation_statistics(teacher_block.attn, train_records)
