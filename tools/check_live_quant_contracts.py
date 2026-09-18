@@ -43,7 +43,7 @@ def _check_comfy(comfy_root: Path) -> None:
         "def detect_layer_quantization(state_dict, prefix):",
         'k.endswith(".comfy_quant")',
         'return {"mixed_ops": True}',
-        "def convert_old_quants(state_dict, model_prefix="", metadata={}):",
+        'def convert_old_quants(state_dict, model_prefix="", metadata={}):',
     )
 
 
