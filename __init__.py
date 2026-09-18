@@ -1,0 +1,444 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import torch
+
+if __package__:
+    from .minimax_h3_keyless.capture_io import CaptureBundleProvenance
+    from .minimax_h3_keyless.live_capture import (
+        StageALiveCaptureController,
+        build_runtime_execution_descriptor,
+        build_stage_a_capture_spec,
+        discover_clean_git_revision,
+        install_stage_a_capture_wrapper,
+        mark_pinned_stage_a_teacher,
+        require_pinned_stage_a_teacher,
+    )
+    from .minimax_h3_keyless.loader import load_keyless_model
+    from .minimax_h3_keyless.progressive_authorization import load_progressive_prefix_manifest
+    from .minimax_h3_keyless.progressive_capture_io import ProgressiveCaptureProvenance
+    from .minimax_h3_keyless.progressive_live_capture import (
+        ProgressiveLiveCaptureController,
+        build_progressive_capture_spec,
+        build_progressive_execution_descriptor,
+        install_progressive_capture_wrapper,
+    )
+    from .minimax_h3_keyless.progressive_overlay import (
+        prepare_progressive_overlay,
+        require_progressive_overlay,
+    )
+    from .minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
+    from .minimax_h3_keyless.teacher import load_pinned_bf16_teacher
+else:
+    from minimax_h3_keyless.capture_io import CaptureBundleProvenance
+    from minimax_h3_keyless.live_capture import (
+        StageALiveCaptureController,
+        build_runtime_execution_descriptor,
+        build_stage_a_capture_spec,
+        discover_clean_git_revision,
+        install_stage_a_capture_wrapper,
+        mark_pinned_stage_a_teacher,
+        require_pinned_stage_a_teacher,
+    )
+    from minimax_h3_keyless.loader import load_keyless_model
+    from minimax_h3_keyless.progressive_authorization import load_progressive_prefix_manifest
+    from minimax_h3_keyless.progressive_capture_io import ProgressiveCaptureProvenance
+    from minimax_h3_keyless.progressive_live_capture import (
+        ProgressiveLiveCaptureController,
+        build_progressive_capture_spec,
+        build_progressive_execution_descriptor,
+        install_progressive_capture_wrapper,
+    )
+    from minimax_h3_keyless.progressive_overlay import (
+        prepare_progressive_overlay,
+        require_progressive_overlay,
+    )
+    from minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
+    from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
+
+
+class MiniMaxH3KeylessLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        return {
+            "required": {
+                "model_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "weight_dtype": (
+                    ["default", "fp8_e4m3fn", "fp8_e4m3fn_fast", "fp8_e5m2"],
+                    {"advanced": True},
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "loaders/advanced"
+    DESCRIPTION = (
+        "Strict loader for h3_keyless_core50_v1 checkpoints. "
+        "It rejects native/mixed QKV artifacts instead of synthesizing a K projection."
+    )
+
+    def load(self, model_name: str, weight_dtype: str = "default"):
+        import folder_paths
+
+        path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        model_options = {}
+        if weight_dtype == "fp8_e4m3fn":
+            model_options["dtype"] = torch.float8_e4m3fn
+        elif weight_dtype == "fp8_e4m3fn_fast":
+            model_options["dtype"] = torch.float8_e4m3fn
+            model_options["fp8_optimizations"] = True
+        elif weight_dtype == "fp8_e5m2":
+            model_options["dtype"] = torch.float8_e5m2
+        return (load_keyless_model(path, model_options=model_options),)
+
+
+class MiniMaxH3StageATeacherLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+        return {"required": {"model_name": (folder_paths.get_filename_list("diffusion_models"),)}}
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "loaders/advanced"
+    DESCRIPTION = (
+        "Stage-A-only loader for the exact pinned native MiniMax H3 BF16 teacher. "
+        "It verifies the full checkpoint SHA-256 and native QKV topology and refuses "
+        "quantized, Keyless, mixed, custom-operation or non-BF16 teachers."
+    )
+
+    def load(self, model_name: str):
+        import folder_paths
+
+        path = folder_paths.get_full_path_or_raise("diffusion_models", model_name)
+        loaded = load_pinned_bf16_teacher(path)
+        mark_pinned_stage_a_teacher(loaded.patcher)
+        return (loaded.patcher,)
+
+
+class MiniMaxH3ProgressiveSnapshotLoader:
+    @classmethod
+    def INPUT_TYPES(cls):
+        import folder_paths
+
+        return {
+            "required": {
+                "teacher_model_name": (folder_paths.get_filename_list("diffusion_models"),),
+                "snapshot_path": ("STRING", {"default": "", "multiline": False}),
+                "snapshot_manifest_path": ("STRING", {"default": "", "multiline": False}),
+                "prefix_manifest_path": ("STRING", {"default": "", "multiline": False}),
+            }
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "load"
+    CATEGORY = "loaders/advanced"
+    DESCRIPTION = (
+        "Phase-4 loader for an immutable h3_keyless_progressive_core50_v1 folded BF16 "
+        "snapshot. It reconstructs the exact accepted QV/native-QKV prefix into a fresh "
+        "pinned BF16 teacher using bounded tensor-at-a-time safetensors reads. The snapshot "
+        "is non-canonical and intended for periodic full-denoiser/media checks; successful "
+        "loading alone is not a parity result."
+    )
+
+    def load(
+        self,
+        teacher_model_name: str,
+        snapshot_path: str,
+        snapshot_manifest_path: str,
+        prefix_manifest_path: str,
+    ):
+        import folder_paths
+
+        snapshot_path = snapshot_path.strip()
+        snapshot_manifest_path = snapshot_manifest_path.strip()
+        prefix_manifest_path = prefix_manifest_path.strip()
+        if not snapshot_path or not snapshot_manifest_path or not prefix_manifest_path:
+            raise ValueError(
+                "progressive snapshot, snapshot manifest and prefix manifest paths must be non-empty"
+            )
+
+        prefix, prefix_manifest_sha256 = load_progressive_prefix_manifest(prefix_manifest_path)
+        plugin_commit = discover_clean_git_revision(
+            Path(__file__).resolve().parent,
+            label="MiniMax-H3-Keyless",
+        )
+        if plugin_commit.lower() != prefix.code_commit.lower():
+            raise RuntimeError(
+                "progressive snapshot loader source revision differs from the sweep revision: "
+                f"runtime={plugin_commit}, prefix={prefix.code_commit}"
+            )
+
+        teacher_path = folder_paths.get_full_path_or_raise(
+            "diffusion_models",
+            teacher_model_name,
+        )
+        loaded = load_pinned_bf16_teacher(teacher_path)
+        diffusion_model = loaded.diffusion_model
+        diffusion_model.to(torch.device("cpu"))
+        load_progressive_snapshot_streaming(
+            diffusion_model,
+            snapshot_path,
+            prefix,
+            prefix_manifest_sha256=prefix_manifest_sha256,
+            manifest_path=snapshot_manifest_path,
+        )
+        # Comfy's ModelPatcher caches module_size after the first query. The mixed snapshot
+        # has smaller accepted QV projections than its native-QKV constructor teacher, so
+        # force the next scheduler query to measure the post-reconstruction topology.
+        loaded.patcher.size = 0
+        return (loaded.patcher,)
+
+
+class MiniMaxH3StageACapture:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "dataset_manifest_path": ("STRING", {"default": "", "multiline": False}),
+                "case_id": ("STRING", {"default": "", "multiline": False}),
+                "target_sigma": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.000001},
+                ),
+                "output_subdir": (
+                    "STRING",
+                    {"default": "keyless_stage_a", "multiline": False},
+                ),
+                "max_capture_mib": (
+                    "INT",
+                    {"default": 8192, "min": 64, "max": 65536, "step": 64},
+                ),
+            },
+            "optional": {
+                "sigma_tolerance": (
+                    "FLOAT",
+                    {"default": 0.000001, "min": 0.0, "max": 0.0001, "step": 0.0000001},
+                ),
+            },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "MiniMax H3/Keyless/training"
+    DESCRIPTION = (
+        "Clone a model loaded by the Stage-A BF16 Teacher Loader and install a one-shot "
+        "native H3 capture at one dataset-declared video sigma. The executed Comfy API "
+        "prompt and declared file-backed asset bytes must match the case's predeclared "
+        "workflow/asset identities. The capture is accepted only when this is the sole "
+        "DIFFUSION_MODEL wrapper and the teacher remains unpatched."
+    )
+
+    def apply(
+        self,
+        model,
+        dataset_manifest_path: str,
+        case_id: str,
+        target_sigma: float,
+        output_subdir: str,
+        max_capture_mib: int,
+        sigma_tolerance: float = 1e-6,
+        prompt=None,
+        unique_id=None,
+    ):
+        import folder_paths
+
+        require_pinned_stage_a_teacher(model)
+        cloned = model.clone()
+        require_pinned_stage_a_teacher(cloned)
+        spec = build_stage_a_capture_spec(
+            dataset_manifest_path,
+            case_id=case_id,
+            target_sigma=float(target_sigma),
+            output_root=folder_paths.get_output_directory(),
+            workflow_prompt=prompt,
+            capture_node_id=unique_id,
+            asset_path_resolver=folder_paths.get_annotated_filepath,
+            output_subdir=output_subdir,
+            max_capture_mib=int(max_capture_mib),
+            sigma_tolerance=float(sigma_tolerance),
+        )
+        plugin_commit = discover_clean_git_revision(
+            Path(__file__).resolve().parent,
+            label="MiniMax-H3-Keyless",
+        )
+        comfy_commit = discover_clean_git_revision(
+            Path(folder_paths.__file__).resolve().parent,
+            label="ComfyUI",
+        )
+        provenance = CaptureBundleProvenance(
+            code_commit=plugin_commit,
+            comfy_commit=comfy_commit,
+            dataset_manifest_sha256=spec.dataset_manifest_sha256,
+            execution_descriptor=build_runtime_execution_descriptor(cloned),
+        )
+        controller = StageALiveCaptureController(spec, provenance)
+        install_stage_a_capture_wrapper(cloned, controller)
+        return (cloned,)
+
+
+class MiniMaxH3ProgressiveOverlay:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "prefix_manifest_path": ("STRING", {"default": "", "multiline": False}),
+            },
+            "optional": {
+                "artifact_dir": ("STRING", {"default": "", "multiline": False}),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "MiniMax H3/Keyless/training"
+    DESCRIPTION = (
+        "Clone the exact pinned native BF16 teacher and install only the hash-validated, "
+        "accepted early-to-late Keyless prefix from an immutable Stage-B prefix manifest. "
+        "Accepted attentions are installed through ModelPatcher object patches so the shared "
+        "native teacher is not mutated. The current plugin revision must exactly match the "
+        "revision that authorized the sweep."
+    )
+
+    def apply(
+        self,
+        model,
+        prefix_manifest_path: str,
+        artifact_dir: str = "",
+    ):
+        plugin_commit = discover_clean_git_revision(
+            Path(__file__).resolve().parent,
+            label="MiniMax-H3-Keyless",
+        )
+        artifact_root = artifact_dir.strip() or None
+        installation = prepare_progressive_overlay(
+            model,
+            prefix_manifest_path,
+            code_commit=plugin_commit,
+            artifact_dir=artifact_root,
+        )
+        return (installation.patcher,)
+
+
+class MiniMaxH3ProgressiveCapture:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "prefix_manifest_path": ("STRING", {"default": "", "multiline": False}),
+                "dataset_manifest_path": ("STRING", {"default": "", "multiline": False}),
+                "case_id": ("STRING", {"default": "", "multiline": False}),
+                "target_sigma": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.000001},
+                ),
+                "output_subdir": (
+                    "STRING",
+                    {"default": "keyless_progressive", "multiline": False},
+                ),
+                "max_capture_mib": (
+                    "INT",
+                    {"default": 8192, "min": 64, "max": 65536, "step": 64},
+                ),
+            },
+            "optional": {
+                "sigma_tolerance": (
+                    "FLOAT",
+                    {"default": 0.000001, "min": 0.0, "max": 0.0001, "step": 0.0000001},
+                ),
+            },
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "MiniMax H3/Keyless/training"
+    DESCRIPTION = (
+        "Clone a validated progressive overlay and install a one-shot full-model capture for "
+        "the next native block. The runtime must execute the exact accepted Keyless prefix "
+        "before the target block, with no other patches, hooks, callbacks or diffusion-model "
+        "wrappers. Evidence is immutable and bound to the prefix, dataset, Stage-A campaign, "
+        "code revision and ComfyUI revision."
+    )
+
+    def apply(
+        self,
+        model,
+        prefix_manifest_path: str,
+        dataset_manifest_path: str,
+        case_id: str,
+        target_sigma: float,
+        output_subdir: str,
+        max_capture_mib: int,
+        sigma_tolerance: float = 1e-6,
+    ):
+        import folder_paths
+
+        prefix, prefix_manifest_sha256 = load_progressive_prefix_manifest(prefix_manifest_path)
+        require_progressive_overlay(
+            model,
+            prefix=prefix,
+            prefix_manifest_sha256=prefix_manifest_sha256,
+        )
+        cloned = model.clone()
+        require_progressive_overlay(
+            cloned,
+            prefix=prefix,
+            prefix_manifest_sha256=prefix_manifest_sha256,
+        )
+        spec = build_progressive_capture_spec(
+            dataset_manifest_path,
+            prefix,
+            prefix_manifest_sha256,
+            case_id=case_id,
+            target_sigma=float(target_sigma),
+            output_root=folder_paths.get_output_directory(),
+            output_subdir=output_subdir,
+            max_capture_mib=int(max_capture_mib),
+            sigma_tolerance=float(sigma_tolerance),
+        )
+        plugin_commit = discover_clean_git_revision(
+            Path(__file__).resolve().parent,
+            label="MiniMax-H3-Keyless",
+        )
+        comfy_commit = discover_clean_git_revision(
+            Path(folder_paths.__file__).resolve().parent,
+            label="ComfyUI",
+        )
+        provenance = ProgressiveCaptureProvenance(
+            code_commit=plugin_commit,
+            comfy_commit=comfy_commit,
+            dataset_manifest_sha256=prefix.dataset_manifest_sha256,
+            gate_manifest_sha256=prefix.gate_manifest_sha256,
+            stage_a_campaign_sha256=prefix.stage_a_campaign_sha256,
+            prefix_identity_sha256=prefix.identity_sha256,
+            target_block=spec.target_block,
+            execution_descriptor=build_progressive_execution_descriptor(cloned, prefix),
+        )
+        controller = ProgressiveLiveCaptureController(spec, prefix, provenance)
+        install_progressive_capture_wrapper(cloned, controller)
+        return (cloned,)
+
+
+NODE_CLASS_MAPPINGS = {
+    "MiniMaxH3KeylessLoader": MiniMaxH3KeylessLoader,
+    "MiniMaxH3StageATeacherLoader": MiniMaxH3StageATeacherLoader,
+    "MiniMaxH3ProgressiveSnapshotLoader": MiniMaxH3ProgressiveSnapshotLoader,
+    "MiniMaxH3StageACapture": MiniMaxH3StageACapture,
+    "MiniMaxH3ProgressiveOverlay": MiniMaxH3ProgressiveOverlay,
+    "MiniMaxH3ProgressiveCapture": MiniMaxH3ProgressiveCapture,
+}
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "MiniMaxH3KeylessLoader": "MiniMax H3 Keyless Loader",
+    "MiniMaxH3StageATeacherLoader": "MiniMax H3 Stage-A BF16 Teacher Loader",
+    "MiniMaxH3ProgressiveSnapshotLoader": "MiniMax H3 Progressive Snapshot Loader",
+    "MiniMaxH3StageACapture": "MiniMax H3 Stage-A Capture",
+    "MiniMaxH3ProgressiveOverlay": "MiniMax H3 Progressive Prefix Overlay",
+    "MiniMaxH3ProgressiveCapture": "MiniMax H3 Progressive Capture",
+}

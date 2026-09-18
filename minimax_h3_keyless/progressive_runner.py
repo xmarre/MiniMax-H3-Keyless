@@ -1,0 +1,719 @@
+from __future__ import annotations
+
+from collections.abc import Sequence as SequenceABC
+from dataclasses import dataclass
+from itertools import chain
+from pathlib import Path
+from typing import Callable, Mapping, Sequence
+
+import torch
+import torch.nn as nn
+
+from .attention import KeylessAttentionTrain
+from .initialization import RouteInitMode
+from .pilot import (
+    PilotLossWeights,
+    build_training_student_block,
+    pilot_train_step,
+    set_pilot_block_stage,
+)
+from .pilot_attention_diagnostics import (
+    PilotAttentionDiagnostic,
+    compare_captured_native_keyless_attention,
+)
+from .pilot_campaign import (
+    PILOT_LS_LAMBDAS,
+    PilotAggregateMetrics,
+    PilotTrainingEvent,
+    evaluate_pilot_cases,
+    validate_pilot_gate_manifest,
+)
+from .pilot_gates import StageAGatePolicy, stage_a_policy_from_gate_manifest
+from .pilot_replay import CapturedReplayReport, pilot_case_to_device, verify_captured_pilot_replay
+from .pilot_runner import (
+    StageAInitializationEvaluation,
+    StageATrainStage,
+    select_stage_a_initialization,
+    validate_stage_a_train_plan,
+)
+from .progressive import PROGRESSIVE_PREFIX_CONTEXT_KEY, ProgressivePrefix
+from .progressive_capture_set import ProgressiveCaptureSet
+from .progressive_gates import ProgressiveBlockGateResult, evaluate_progressive_block_gate
+from .progressive_training_resume import (
+    ProgressiveTrainingResumeIdentity,
+    ProgressiveTrainingResumeRequest,
+    ProgressiveTrainingResumeState,
+    load_progressive_training_resume,
+    restore_progressive_training_resume,
+    save_progressive_training_resume,
+)
+from .route_fit import (
+    RouteActivationFit,
+    collect_route_activation_statistics,
+    solve_route_activation_fit,
+)
+
+
+StudentBuilder = Callable[[nn.Module, int, RouteInitMode, float], tuple[nn.Module, object]]
+OptimizerFactory = Callable[[Sequence[nn.Parameter], float, float], torch.optim.Optimizer]
+_SELECTION_SPLIT = "train_complete_cases"
+
+
+@dataclass
+class ProgressiveBlockTrainingResult:
+    """Unaccepted Stage-B candidate plus all local evidence used to decide its gate.
+
+    Returning the candidate separately from ``ProgressivePrefix.advance`` is deliberate:
+    a failed experiment cannot mutate the accepted model/prefix merely by completing a
+    training call. Persistence and installation are a later explicit acceptance step.
+    ``optimizer`` is retained so the final training stage can be persisted with optimizer
+    and RNG state before the candidate is accepted.
+    """
+
+    block_index: int
+    prefix_identity_sha256: str
+    selection_split: str
+    replay_reports: tuple[CapturedReplayReport, ...]
+    initialization_evaluations: tuple[StageAInitializationEvaluation, ...]
+    selected_route_mode: RouteInitMode
+    selected_lambda_relative: float
+    identity_baseline: PilotAggregateMetrics
+    least_squares_baseline: PilotAggregateMetrics
+    least_squares_baseline_lambda_relative: float
+    candidate: PilotAggregateMetrics
+    candidate_attention_diagnostics: tuple[PilotAttentionDiagnostic, ...]
+    training_events: tuple[PilotTrainingEvent, ...]
+    gate: ProgressiveBlockGateResult
+    final_stage: str
+    student_block: nn.Module
+    optimizer: torch.optim.Optimizer
+
+
+def _default_builder(
+    teacher_block: nn.Module,
+    block_index: int,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+) -> tuple[nn.Module, object]:
+    if route_mode != "identity" or float(lambda_relative) != 0.0:
+        raise ValueError("progressive structural builder only accepts identity initialization")
+    return build_training_student_block(
+        teacher_block,
+        block_index=block_index,
+        route_mode="identity",
+        lambda_relative=0.0,
+    )
+
+
+def _default_optimizer(
+    parameters: Sequence[nn.Parameter], learning_rate: float, weight_decay: float
+) -> torch.optim.Optimizer:
+    return torch.optim.AdamW(
+        parameters,
+        lr=float(learning_rate),
+        weight_decay=float(weight_decay),
+    )
+
+
+def _require_native_teacher_block(
+    teacher_block: nn.Module,
+    *,
+    require_bf16: bool,
+) -> None:
+    attention = getattr(teacher_block, "attn", None)
+    if attention is None or isinstance(attention, KeylessAttentionTrain):
+        raise RuntimeError("progressive local teacher must contain the original native QKV attention")
+    required = ("qkv_proj", "q_norm", "k_norm", "out_proj", "heads", "head_dim")
+    missing = [name for name in required if getattr(attention, name, None) is None]
+    if missing:
+        raise RuntimeError(f"progressive native teacher attention is missing {missing}")
+    if getattr(attention, "qv_proj", None) is not None or getattr(attention, "query_route", None) is not None:
+        raise RuntimeError("progressive local teacher must not already be a Keyless/QV attention")
+    weight = getattr(attention.qkv_proj, "weight", None)
+    if not torch.is_tensor(weight) or weight.ndim != 2 or getattr(weight, "is_meta", False):
+        raise RuntimeError("progressive native teacher requires a materialized QKV weight")
+    if not weight.is_floating_point():
+        raise RuntimeError("progressive native teacher QKV weight must be floating point")
+    if require_bf16 and weight.dtype != torch.bfloat16:
+        raise RuntimeError(
+            f"production progressive teacher must be BF16, got {weight.dtype}"
+        )
+
+
+def _validate_record_binding(
+    record,
+    *,
+    split: str,
+    prefix: ProgressivePrefix,
+    target: int,
+) -> None:
+    if record.block_index != target:
+        raise RuntimeError(
+            "progressive capture record targets the wrong block: "
+            f"expected={target}, actual={record.block_index}"
+        )
+    context = record.case.context
+    if not isinstance(context, Mapping):
+        raise RuntimeError("progressive capture record context must be a mapping")
+    bound = context.get(PROGRESSIVE_PREFIX_CONTEXT_KEY)
+    if not isinstance(bound, Mapping):
+        raise RuntimeError("progressive capture record is missing bound prefix context")
+    expected = {
+        "api": 1,
+        "prefix_identity_sha256": prefix.identity_sha256,
+        "accepted_blocks": list(prefix.accepted_blocks),
+        "next_block": target,
+        "stage_a_campaign_sha256": prefix.stage_a_campaign_sha256,
+        "dataset_manifest_sha256": prefix.dataset_manifest_sha256,
+        "gate_manifest_sha256": prefix.gate_manifest_sha256,
+    }
+    mismatches = [name for name, value in expected.items() if bound.get(name) != value]
+    if mismatches:
+        raise RuntimeError(
+            "progressive capture record prefix context differs from accepted prefix: "
+            + ", ".join(mismatches)
+        )
+    recorded_split = context.get("progressive_split")
+    if recorded_split != split:
+        raise RuntimeError(
+            "progressive capture record split annotation differs from capture set: "
+            f"expected={split!r}, actual={recorded_split!r}"
+        )
+
+
+def _validate_capture_context(
+    captures: ProgressiveCaptureSet,
+    prefix: ProgressivePrefix,
+) -> int:
+    target = prefix.next_block
+    if target is None:
+        raise RuntimeError("progressive prefix is already complete")
+    expected = {
+        "target_block": target,
+        "prefix_identity_sha256": prefix.identity_sha256.lower(),
+        "stage_a_campaign_sha256": prefix.stage_a_campaign_sha256.lower(),
+        "dataset_manifest_sha256": prefix.dataset_manifest_sha256.lower(),
+        "gate_manifest_sha256": prefix.gate_manifest_sha256.lower(),
+    }
+    actual = {
+        "target_block": captures.target_block,
+        "prefix_identity_sha256": captures.prefix_identity_sha256.lower(),
+        "stage_a_campaign_sha256": captures.stage_a_campaign_sha256.lower(),
+        "dataset_manifest_sha256": captures.dataset_manifest_sha256.lower(),
+        "gate_manifest_sha256": captures.gate_manifest_sha256.lower(),
+    }
+    mismatches = [name for name, value in expected.items() if actual[name] != value]
+    if mismatches:
+        raise RuntimeError(
+            "progressive capture set is not bound to the requested accepted prefix: "
+            + ", ".join(mismatches)
+        )
+    if captures.code_commit.lower() != prefix.code_commit.lower():
+        raise RuntimeError("progressive capture set source revision differs from sweep revision")
+    if not captures.train or not captures.holdout:
+        raise RuntimeError("progressive target requires non-empty train and holdout captures")
+    for split, records in (("train", captures.train), ("holdout", captures.holdout)):
+        for record in records:
+            _validate_record_binding(record, split=split, prefix=prefix, target=target)
+    return target
+
+
+class _DeviceCaseSequence(SequenceABC):
+    """Move exactly one capture case to the training device on demand."""
+
+    def __init__(self, records, device: torch.device) -> None:
+        self._records = records
+        self._device = device
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return tuple(self[position] for position in range(*index.indices(len(self))))
+        return pilot_case_to_device(self._records[index].case, self._device)
+
+
+def _move_cases(records, device: torch.device):
+    # A lazy Sequence is intentional. Materializing all cases on CUDA defeats the bounded
+    # capture-corpus contract even when the CPU records themselves are lazy.
+    return _DeviceCaseSequence(records, device)
+
+
+def _install_route_fit(student: nn.Module, fit: RouteActivationFit) -> None:
+    attention = getattr(student, "attn", None)
+    route = getattr(attention, "query_route", None)
+    weight = getattr(route, "weight", None)
+    if not torch.is_tensor(weight) or getattr(weight, "is_meta", False):
+        raise RuntimeError("progressive student does not expose a materialized query_route weight")
+    if tuple(weight.shape) != tuple(fit.storage_weight.shape):
+        raise RuntimeError("progressive route fit geometry does not match student query_route")
+    with torch.no_grad():
+        weight.copy_(fit.storage_weight.to(device=weight.device, dtype=weight.dtype))
+
+
+def _build_student(
+    teacher_block: nn.Module,
+    *,
+    block_index: int,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> nn.Module:
+    student, _ = student_builder(teacher_block, block_index, "identity", 0.0)
+    attention = getattr(student, "attn", None)
+    if not isinstance(attention, KeylessAttentionTrain):
+        raise RuntimeError("progressive student builder must install KeylessAttentionTrain")
+    if int(getattr(attention, "block_index", -1)) != block_index:
+        raise RuntimeError("progressive student builder installed the wrong block_index")
+    if route_mode == "identity":
+        return student
+    fit = route_fits.get(float(lambda_relative))
+    if fit is None:
+        raise RuntimeError(
+            f"missing progressive activation-derived route fit for lambda={lambda_relative:g}"
+        )
+    _install_route_fit(student, fit)
+    return student
+
+
+def _attention_diagnostics(
+    teacher_block: nn.Module,
+    student_block: nn.Module,
+    records,
+) -> tuple[PilotAttentionDiagnostic, ...]:
+    teacher_attention = getattr(teacher_block, "attn", None)
+    student_attention = getattr(student_block, "attn", None)
+    if teacher_attention is None or not isinstance(student_attention, KeylessAttentionTrain):
+        raise RuntimeError("progressive attention diagnostic topology is invalid")
+    out = tuple(
+        compare_captured_native_keyless_attention(
+            teacher_attention,
+            student_attention,
+            record,
+        )
+        for record in records
+    )
+    if not out:
+        raise RuntimeError("progressive attention diagnostics require captured cases")
+    if tuple(row.case_id for row in out) != tuple(record.case.case_id for record in records):
+        raise RuntimeError("progressive attention diagnostic case ordering diverged from captures")
+    return out
+
+
+def _evaluate_initializations(
+    teacher_block: nn.Module,
+    *,
+    block_index: int,
+    train_cases,
+    train_records,
+    device: torch.device,
+    weights: PilotLossWeights,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> tuple[
+    tuple[StageAInitializationEvaluation, ...],
+    StageAInitializationEvaluation,
+    StageAInitializationEvaluation,
+]:
+    evaluations: list[StageAInitializationEvaluation] = []
+    grid: tuple[tuple[RouteInitMode, float], ...] = (
+        ("identity", 0.0),
+        *(("least_squares", value) for value in PILOT_LS_LAMBDAS),
+    )
+    for route_mode, lambda_relative in grid:
+        student = _build_student(
+            teacher_block,
+            block_index=block_index,
+            route_mode=route_mode,
+            lambda_relative=float(lambda_relative),
+            route_fits=route_fits,
+            student_builder=student_builder,
+        )
+        student.to(device)
+        student.eval()
+        metrics = evaluate_pilot_cases(
+            teacher_block,
+            student,
+            train_cases,
+            weights=weights,
+        )
+        diagnostics = _attention_diagnostics(teacher_block, student, train_records)
+        fit = None if route_mode == "identity" else route_fits[float(lambda_relative)]
+        evaluations.append(
+            StageAInitializationEvaluation(
+                route_mode=route_mode,
+                lambda_relative=float(lambda_relative),
+                metrics=metrics,
+                route_fit_diagnostics=None if fit is None else fit.diagnostics,
+                attention_diagnostics=diagnostics,
+            )
+        )
+        del student
+
+    rows = tuple(evaluations)
+    selected = select_stage_a_initialization(rows)
+    best_ls = min(
+        (row for row in rows if row.route_mode == "least_squares"),
+        key=lambda row: (
+            float(row.metrics.mean_attention_normalized_mse),
+            float(row.metrics.mean_block_normalized_mse),
+            float(row.lambda_relative),
+        ),
+    )
+    return rows, selected, best_ls
+
+
+def _evaluate_untrained_baseline(
+    teacher_block: nn.Module,
+    cases,
+    *,
+    block_index: int,
+    device: torch.device,
+    weights: PilotLossWeights,
+    route_mode: RouteInitMode,
+    lambda_relative: float,
+    route_fits: Mapping[float, RouteActivationFit],
+    student_builder: StudentBuilder,
+) -> PilotAggregateMetrics:
+    student = _build_student(
+        teacher_block,
+        block_index=block_index,
+        route_mode=route_mode,
+        lambda_relative=lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    student.to(device)
+    student.eval()
+    try:
+        return evaluate_pilot_cases(
+            teacher_block,
+            student,
+            cases,
+            weights=weights,
+        )
+    finally:
+        del student
+
+
+def _resume_identity(
+    prefix: ProgressivePrefix,
+    request: ProgressiveTrainingResumeRequest,
+    *,
+    block_index: int,
+    selected_route_mode: RouteInitMode,
+    selected_lambda_relative: float,
+) -> ProgressiveTrainingResumeIdentity:
+    return ProgressiveTrainingResumeIdentity(
+        sweep_id=prefix.sweep_id,
+        code_commit=prefix.code_commit,
+        stage_a_campaign_sha256=prefix.stage_a_campaign_sha256,
+        dataset_manifest_sha256=prefix.dataset_manifest_sha256,
+        gate_manifest_sha256=prefix.gate_manifest_sha256,
+        prefix_identity_sha256=prefix.identity_sha256,
+        prefix_manifest_sha256=request.prefix_manifest_sha256,
+        capture_registry_file_sha256=request.capture_registry_file_sha256,
+        train_plan_identity_sha256=request.train_plan_identity_sha256,
+        train_plan_file_sha256=request.train_plan_file_sha256,
+        block_index=block_index,
+        selected_route_mode=selected_route_mode,
+        selected_lambda_relative=float(selected_lambda_relative),
+    )
+
+
+def _validate_resume_progress(
+    state: ProgressiveTrainingResumeState,
+    plan: Sequence[StageATrainStage],
+    *,
+    train_case_ids: Sequence[str],
+) -> None:
+    if state.stage_index >= len(plan):
+        raise RuntimeError("progressive training resume stage_index exceeds the fixed train plan")
+    spec = plan[state.stage_index]
+    if state.stage != spec.stage:
+        raise RuntimeError("progressive training resume stage differs from the fixed train plan")
+    if state.completed_epochs > spec.epochs:
+        raise RuntimeError("progressive training resume completed_epochs exceeds the fixed stage")
+
+    case_ids = tuple(train_case_ids)
+    if not case_ids:
+        raise RuntimeError("progressive training resume requires non-empty train cases")
+    if any(not isinstance(case_id, str) or not case_id for case_id in case_ids):
+        raise RuntimeError("progressive training resume train case IDs are invalid")
+
+    expected: list[tuple[str, int, str]] = []
+    for prior in plan[: state.stage_index]:
+        for epoch in range(prior.epochs):
+            expected.extend((prior.stage, epoch, case_id) for case_id in case_ids)
+    for epoch in range(state.completed_epochs):
+        expected.extend((state.stage, epoch, case_id) for case_id in case_ids)
+
+    actual = [(row.stage, row.epoch, row.case_id) for row in state.events]
+    if len(actual) != len(expected):
+        raise RuntimeError(
+            "progressive training resume event count is inconsistent with its stage/epoch progress"
+        )
+    if actual != expected:
+        mismatch = next(
+            index
+            for index, (actual_row, expected_row) in enumerate(zip(actual, expected))
+            if actual_row != expected_row
+        )
+        raise RuntimeError(
+            "progressive training resume event ordering/content differs from the exact "
+            "capture traversal: "
+            f"index={mismatch}, actual={actual[mismatch]!r}, expected={expected[mismatch]!r}"
+        )
+
+
+def _preflight_resume_request(request: ProgressiveTrainingResumeRequest | None) -> None:
+    if request is None:
+        return
+    path = Path(request.path)
+    if request.resume and not path.is_file():
+        raise FileNotFoundError(f"progressive resume checkpoint does not exist: {path}")
+    if not request.resume and path.exists():
+        raise FileExistsError(
+            f"progressive resume checkpoint already exists; use explicit resume mode or remove it: {path}"
+        )
+
+
+def run_progressive_block_training(
+    teacher_block: nn.Module,
+    captures: ProgressiveCaptureSet,
+    prefix: ProgressivePrefix,
+    *,
+    device: str | torch.device,
+    gate_manifest: Mapping[str, object],
+    train_plan: Sequence[StageATrainStage],
+    loss_weights: PilotLossWeights = PilotLossWeights(),
+    same_input_atol: float = 0.0,
+    same_input_rtol: float = 0.0,
+    student_builder: StudentBuilder = _default_builder,
+    optimizer_factory: OptimizerFactory = _default_optimizer,
+    require_bf16_teacher: bool = True,
+    resume_request: ProgressiveTrainingResumeRequest | None = None,
+) -> ProgressiveBlockTrainingResult:
+    """Train one early-to-late Stage-B block without mutating the accepted prefix/model.
+
+    Captures must come from the current partially converted model under ``prefix``. The
+    frozen original QKV block is replayed on those exact inputs and must reproduce the
+    recorded post-AdaLN execution point before route fitting or optimization begins.
+    Initialization and LS-lambda selection use complete training cases only. The holdout
+    is evaluated only for the train-selected untrained baselines and the trained candidate
+    that feed the frozen progressive exit gate.
+
+    Lazy capture sets and case sequences are consumed one artifact at a time so production
+    training does not retain the complete target-block corpus in CPU or GPU memory.
+
+    When ``resume_request`` is supplied, a mutable crash-recovery checkpoint is replaced
+    atomically after each complete epoch. Resume is explicit and identity-bound to the
+    prefix manifest, capture registry, fixed train plan and train-selected initialization.
+    A partial epoch is deliberately replayed from the previous completed-epoch checkpoint.
+    The returned Keyless block is only a candidate; callers must persist and explicitly
+    accept it after ``result.gate.passed`` before replacing the live model block.
+    """
+
+    _preflight_resume_request(resume_request)
+    block_index = _validate_capture_context(captures, prefix)
+    gate_sha = validate_pilot_gate_manifest(gate_manifest)
+    if gate_sha.lower() != prefix.gate_manifest_sha256.lower():
+        raise RuntimeError("supplied progressive gate manifest differs from fixed sweep policy")
+    if captures.gate_manifest_sha256.lower() != gate_sha.lower():
+        raise RuntimeError("progressive capture set gate identity differs from supplied policy")
+    policy: StageAGatePolicy = stage_a_policy_from_gate_manifest(gate_manifest)
+    plan = validate_stage_a_train_plan(train_plan)
+    _require_native_teacher_block(teacher_block, require_bf16=require_bf16_teacher)
+
+    device = torch.device(device)
+    teacher_block.to(device)
+    teacher_block.eval()
+    for parameter in teacher_block.parameters():
+        parameter.requires_grad_(False)
+
+    train_records = captures.records("train")
+    holdout_records = captures.records("holdout")
+    replay_reports = tuple(
+        verify_captured_pilot_replay(
+            teacher_block,
+            record,
+            device=device,
+            same_input_atol=same_input_atol,
+            same_input_rtol=same_input_rtol,
+        )
+        for record in chain(train_records, holdout_records)
+    )
+
+    route_statistics = collect_route_activation_statistics(teacher_block.attn, train_records)
+    route_fits = {
+        float(lambda_relative): solve_route_activation_fit(
+            route_statistics,
+            lambda_relative=float(lambda_relative),
+        )
+        for lambda_relative in PILOT_LS_LAMBDAS
+    }
+    train_cases = _move_cases(train_records, device)
+    holdout_cases = _move_cases(holdout_records, device)
+
+    evaluations, selected, best_ls = _evaluate_initializations(
+        teacher_block,
+        block_index=block_index,
+        train_cases=train_cases,
+        train_records=train_records,
+        device=device,
+        weights=loss_weights,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    identity_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="identity",
+        lambda_relative=0.0,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    least_squares_baseline = _evaluate_untrained_baseline(
+        teacher_block,
+        holdout_cases,
+        block_index=block_index,
+        device=device,
+        weights=loss_weights,
+        route_mode="least_squares",
+        lambda_relative=best_ls.lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+
+    student = _build_student(
+        teacher_block,
+        block_index=block_index,
+        route_mode=selected.route_mode,
+        lambda_relative=selected.lambda_relative,
+        route_fits=route_fits,
+        student_builder=student_builder,
+    )
+    student.to(device)
+
+    resume_identity: ProgressiveTrainingResumeIdentity | None = None
+    resume_state: ProgressiveTrainingResumeState | None = None
+    if resume_request is not None:
+        resume_identity = _resume_identity(
+            prefix,
+            resume_request,
+            block_index=block_index,
+            selected_route_mode=selected.route_mode,
+            selected_lambda_relative=selected.lambda_relative,
+        )
+        if resume_request.resume:
+            resume_state = load_progressive_training_resume(
+                resume_request.path,
+                expected_identity=resume_identity,
+            )
+            _validate_resume_progress(
+                resume_state,
+                plan,
+                train_case_ids=tuple(record.case.case_id for record in train_records),
+            )
+
+    events: list[PilotTrainingEvent] = [] if resume_state is None else list(resume_state.events)
+    optimizer: torch.optim.Optimizer | None = None
+    for stage_index, spec in enumerate(plan):
+        if resume_state is not None and stage_index < resume_state.stage_index:
+            continue
+
+        set_pilot_block_stage(student, spec.stage)
+        parameters = [parameter for parameter in student.parameters() if parameter.requires_grad]
+        if not parameters:
+            raise RuntimeError(f"progressive stage {spec.stage!r} exposed no trainable parameters")
+        optimizer = optimizer_factory(parameters, spec.learning_rate, spec.weight_decay)
+        start_epoch = 0
+        if resume_state is not None and stage_index == resume_state.stage_index:
+            restore_progressive_training_resume(
+                resume_state,
+                student_block=student,
+                optimizer=optimizer,
+                restore_rng=True,
+            )
+            start_epoch = resume_state.completed_epochs
+
+        for epoch in range(start_epoch, spec.epochs):
+            student.train(True)
+            for case in train_cases:
+                report = pilot_train_step(
+                    teacher_block,
+                    student,
+                    case,
+                    optimizer,
+                    weights=loss_weights,
+                    max_grad_norm=spec.max_grad_norm,
+                )
+                events.append(
+                    PilotTrainingEvent(
+                        stage=spec.stage,
+                        epoch=epoch,
+                        case_id=case.case_id,
+                        report=report,
+                    )
+                )
+            if resume_request is not None:
+                assert resume_identity is not None
+                save_progressive_training_resume(
+                    resume_request.path,
+                    student_block=student,
+                    optimizer=optimizer,
+                    identity=resume_identity,
+                    stage_index=stage_index,
+                    stage=spec.stage,
+                    completed_epochs=epoch + 1,
+                    events=tuple(events),
+                )
+
+        # The checkpoint has now been consumed. Later stages use their own optimizer and
+        # inherit the restored student/RNG state exactly once.
+        if resume_state is not None and stage_index == resume_state.stage_index:
+            resume_state = None
+
+    assert optimizer is not None
+
+    candidate = evaluate_pilot_cases(
+        teacher_block,
+        student,
+        holdout_cases,
+        weights=loss_weights,
+    )
+    candidate_diagnostics = _attention_diagnostics(teacher_block, student, holdout_records)
+    event_tuple = tuple(events)
+    gate = evaluate_progressive_block_gate(
+        block_index=block_index,
+        candidate=candidate,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
+        training_events=event_tuple,
+        policy=policy,
+    )
+
+    return ProgressiveBlockTrainingResult(
+        block_index=block_index,
+        prefix_identity_sha256=prefix.identity_sha256,
+        selection_split=_SELECTION_SPLIT,
+        replay_reports=replay_reports,
+        initialization_evaluations=evaluations,
+        selected_route_mode=selected.route_mode,
+        selected_lambda_relative=selected.lambda_relative,
+        identity_baseline=identity_baseline,
+        least_squares_baseline=least_squares_baseline,
+        least_squares_baseline_lambda_relative=best_ls.lambda_relative,
+        candidate=candidate,
+        candidate_attention_diagnostics=candidate_diagnostics,
+        training_events=event_tuple,
+        gate=gate,
+        final_stage=plan[-1].stage,
+        student_block=student,
+        optimizer=optimizer,
+    )

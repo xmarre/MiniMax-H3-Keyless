@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "minimax-h3-keyless"
+version = "0.1.0.dev0"
+description = "MiniMax H3 Keyless Attention reference implementation and conversion tooling"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.5", "safetensors>=0.4", "numpy>=1.26"]
+
+[tool.setuptools.packages.find]
+include = ["minimax_h3_keyless*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
