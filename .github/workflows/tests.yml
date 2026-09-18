@@ -30,3 +30,32 @@ jobs:
         run: python -m compileall -q __init__.py minimax_h3_keyless tests tools
       - name: Run CPU contract tests
         run: python -m pytest
+
+  live-quant-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install bounded contract dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu torch==2.9.1
+          python -m pip install numpy packaging
+      - name: Fetch audited quantization owners
+        run: |
+          mkdir -p .contracts
+          git clone --filter=blob:none https://github.com/Comfy-Org/ComfyUI.git .contracts/ComfyUI
+          git -C .contracts/ComfyUI checkout 7de99222f06e1b6cddb1868859319010bd7ac878
+          git clone --filter=blob:none https://github.com/Comfy-Org/comfy-kitchen.git .contracts/comfy-kitchen
+          git -C .contracts/comfy-kitchen checkout b2a2972ac68c395bbda8ad9030e8ae1089287815
+      - name: Validate live INT8 ConvRot storage and loader contract
+        run: |
+          python tools/check_live_quant_contracts.py \
+            --comfy .contracts/ComfyUI \
+            --kitchen .contracts/comfy-kitchen
+
