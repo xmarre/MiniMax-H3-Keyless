@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -327,11 +328,34 @@ def read_safetensors_signatures(path: str | Path) -> tuple[dict[str, TensorSigna
     return tensors, metadata
 
 
-def sha256_file(path: str | Path, chunk_size: int = 8 * 1024 * 1024) -> str:
+def _advise_drop_file_cache(fd: int, offset: int, length: int) -> None:
+    advise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if callable(advise) and dontneed is not None:
+        try:
+            advise(fd, offset, length, dontneed)
+        except OSError:
+            pass
+
+
+def sha256_file(path: str | Path, chunk_size: int = 64 * 1024 * 1024) -> str:
+    """Hash large artifacts without letting Linux/WSL page cache grow unbounded."""
     h = hashlib.sha256()
-    with open(path, "rb") as f:
+    with open(path, "rb", buffering=0) as f:
+        advise = getattr(os, "posix_fadvise", None)
+        sequential = getattr(os, "POSIX_FADV_SEQUENTIAL", None)
+        if callable(advise) and sequential is not None:
+            try:
+                advise(f.fileno(), 0, 0, sequential)
+            except OSError:
+                pass
+        offset = 0
         while chunk := f.read(chunk_size):
             h.update(chunk)
+            consumed = len(chunk)
+            _advise_drop_file_cache(f.fileno(), offset, consumed)
+            offset += consumed
+        _advise_drop_file_cache(f.fileno(), 0, 0)
     return h.hexdigest()
 
 

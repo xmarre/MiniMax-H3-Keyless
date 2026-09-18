@@ -195,3 +195,24 @@ def test_capture_provenance_cannot_claim_a_different_teacher() -> None:
     with pytest.raises(ValueError, match="teacher SHA-256"):
         _provenance(teacher_model_sha256="0" * 64)
     assert TEACHER_SHA256 != "0" * 64
+
+
+def test_capture_bundle_forwards_explicit_map_location(tmp_path: Path, monkeypatch) -> None:
+    path = tmp_path / "capture.pt"
+    written = write_captured_pilot_bundle(path, _records(), provenance=_provenance())
+    original_load = torch.load
+    seen = {}
+
+    def wrapped_load(*args, **kwargs):
+        seen["map_location"] = kwargs.get("map_location")
+        kwargs["map_location"] = "cpu"
+        return original_load(*args, **kwargs)
+
+    monkeypatch.setattr(torch, "load", wrapped_load)
+    loaded, _ = load_captured_pilot_bundle(
+        path,
+        expected_receipt_sha256=written.receipt_sha256,
+        map_location="cuda:0",
+    )
+    assert seen["map_location"] == "cuda:0"
+    assert loaded[0].attention_input.device.type == "cpu"
