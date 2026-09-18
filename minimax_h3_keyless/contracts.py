@@ -125,10 +125,18 @@ class RowDomain:
 
 @dataclass(frozen=True)
 class RoutingPreprocessor:
-    """Routing-only transformation. It must never be applied to retrieval V."""
+    """Routing-only transformation. It must never be applied to retrieval V.
+
+    domain_fn is the selected/reordered-domain ABI. Providers that reduce the V
+    domain before route materialization may use only preprocessors that expose this
+    callable; legacy fn remains valid for full-domain materialization.
+    """
 
     identity: str
     fn: Callable[[torch.Tensor], torch.Tensor] = field(compare=False, repr=False)
+    domain_fn: Callable[
+        [torch.Tensor, "RowDomain | None", "RowDomain | None"], torch.Tensor
+    ] | None = field(default=None, compare=False, repr=False)
 
 
 Selector = slice | torch.Tensor | tuple[int, ...] | list[int]
