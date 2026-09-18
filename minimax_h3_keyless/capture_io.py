@@ -349,13 +349,16 @@ def load_captured_pilot_bundle(
     *,
     receipt_path: str | Path | None = None,
     expected_receipt_sha256: str | None = None,
+    map_location: str | torch.device = "cpu",
 ) -> tuple[tuple[CapturedPilotCase, ...], CaptureBundleProvenance]:
     """Load a capture only after receipt/hash/provenance validation.
 
     The bundle hash is checked before deserialization. ``weights_only=True`` remains
     mandatory because capture bundles are data artifacts, not executable checkpoints.
     Passing ``expected_receipt_sha256`` additionally binds the sidecar itself to an
-    immutable run/artifact registry identity.
+    immutable run/artifact registry identity. ``map_location`` defaults to CPU for
+    existing Stage-A callers; diagnostics with ample VRAM may deserialize directly to
+    CUDA to avoid retaining the multi-GB capture payload in host RAM.
     """
     path = Path(path)
     receipt_path = (
@@ -369,7 +372,7 @@ def load_captured_pilot_bundle(
         expected_receipt_sha256=expected_receipt_sha256,
     )
 
-    payload = torch.load(path, map_location="cpu", weights_only=True)
+    payload = torch.load(path, map_location=map_location, weights_only=True)
     if not isinstance(payload, dict) or payload.get("schema") != CAPTURE_BUNDLE_SCHEMA:
         raise ValueError("capture bundle has an unsupported schema")
     provenance_raw = payload.get("provenance")
