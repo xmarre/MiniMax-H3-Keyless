@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from minimax_h3_keyless.contracts import RoutingPreprocessor, RoutingSpecV1
+from minimax_h3_keyless.contracts import RowDomain, RoutingPreprocessor, RoutingSpecV1
 from minimax_h3_keyless.ops import (
     apply_h3_split_half_rope,
     dense_reference_attention,
@@ -58,6 +58,53 @@ def test_materialized_route_never_mutates_retrieval_value() -> None:
     torch.testing.assert_close(v, before)
     assert route.data_ptr() != v.data_ptr()
     torch.testing.assert_close(route, rms_norm(v, torch.ones(3), 1e-5) * 2.0)
+
+
+def test_domain_aware_preprocessor_receives_composed_domains_after_selection() -> None:
+    torch.manual_seed(22)
+    v = torch.randn(5, 2, 4)
+    calls = []
+
+    def full_only(_route):
+        raise AssertionError("selected-domain materialization must use domain_fn")
+
+    def domain_fn(route, value_domain, routing_position_domain):
+        calls.append((value_domain, routing_position_domain))
+        return route * 3.0
+
+    spec = RoutingSpecV1(
+        api=1,
+        block_index=4,
+        norm_weight=torch.ones(4),
+        norm_epsilon=1e-5,
+        value_domain=RowDomain(start=10, stop=15, identity="values"),
+        routing_position_domain=RowDomain(start=100, stop=105, identity="positions"),
+        preprocessors=(
+            RoutingPreprocessor(
+                "domain-aware",
+                full_only,
+                domain_fn,
+            ),
+        ),
+    )
+    selected_v, selected_spec, _ = spec.select_value_rows(
+        v,
+        (4, 1, 3),
+        identity="vdn-window",
+    )
+
+    route = materialize_route(selected_v, selected_spec)
+
+    assert calls == [
+        (
+            RowDomain(indices=(14, 11, 13), identity="vdn-window"),
+            RowDomain(indices=(104, 101, 103), identity="vdn-window"),
+        )
+    ]
+    torch.testing.assert_close(
+        route,
+        rms_norm(selected_v, torch.ones(4), 1e-5) * 3.0,
+    )
 
 
 def test_dense_oracle_matches_torch_sdpa_with_measure_and_mask() -> None:
