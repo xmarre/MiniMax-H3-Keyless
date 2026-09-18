@@ -72,6 +72,62 @@ def test_provider_receives_raw_projected_value_not_route() -> None:
     assert not torch.allclose(provider.route, provider.v)
 
 
+def test_foreign_domain_aware_preprocessor_survives_attention_wrapping() -> None:
+    class DomainAware:
+        identity = "domain-aware-test"
+
+        def __init__(self):
+            self.calls = []
+
+        def __call__(self, route):
+            return route
+
+        def apply_domain(self, route, value_domain, routing_position_domain):
+            self.calls.append((value_domain, routing_position_domain))
+            return route
+
+    class SelectingProvider:
+        api = 1
+
+        def __init__(self):
+            self.route = None
+
+        def __call__(self, **kwargs):
+            selected_v, selected_routing, _ = kwargs["routing"].select_value_rows(
+                kwargs["v"],
+                (2, 0),
+                identity="selected",
+            )
+            self.route = selected_routing.materialize(selected_v)
+            return torch.zeros_like(kwargs["q"])
+
+    attn = KeylessAttentionDeploy(4, 2, 2, 1e-5, dtype=torch.float32)
+    with torch.no_grad():
+        attn.qv_proj.weight.normal_()
+        attn.q_norm.weight.fill_(1.0)
+        attn.route_norm.weight.fill_(1.0)
+        attn.out_proj.weight.normal_()
+
+    preprocessor = DomainAware()
+    provider = SelectingProvider()
+    x = torch.randn(3, 4)
+    attn(
+        x,
+        transformer_options={
+            PROVIDER_KEY: provider,
+            "minimax_h3_keyless_routing_preprocessors_v1": (preprocessor,),
+        },
+    )
+
+    assert provider.route is not None
+    assert len(preprocessor.calls) == 1
+    value_domain, routing_position_domain = preprocessor.calls[0]
+    assert value_domain.indices == (2, 0)
+    assert routing_position_domain.indices == (2, 0)
+    assert value_domain.identity == "selected"
+    assert routing_position_domain.identity == "selected"
+
+
 def test_bad_provider_api_fails_closed() -> None:
     class BadProvider:
         api = 2
