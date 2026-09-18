@@ -30,6 +30,7 @@ if __package__:
     )
     from .minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
     from .minimax_h3_keyless.teacher import load_pinned_bf16_teacher
+    from .minimax_h3_keyless.real_h3_replay_capture import install_from_comfy_node
 else:
     from minimax_h3_keyless.capture_io import CaptureBundleProvenance
     from minimax_h3_keyless.live_capture import (
@@ -56,6 +57,7 @@ else:
     )
     from minimax_h3_keyless.progressive_snapshot_runtime import load_progressive_snapshot_streaming
     from minimax_h3_keyless.teacher import load_pinned_bf16_teacher
+    from minimax_h3_keyless.real_h3_replay_capture import install_from_comfy_node
 
 
 class MiniMaxH3KeylessLoader:
@@ -282,6 +284,75 @@ class MiniMaxH3StageACapture:
         return (cloned,)
 
 
+
+class MiniMaxH3RealH3ReplayCapture:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "target_sigma": (
+                    "FLOAT",
+                    {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.000001},
+                ),
+                "output_subdir": (
+                    "STRING",
+                    {"default": "keyless_real_h3_replay", "multiline": False},
+                ),
+                "max_capture_mib": (
+                    "INT",
+                    {"default": 8192, "min": 64, "max": 65536, "step": 64},
+                ),
+            },
+            "optional": {
+                "sigma_tolerance": (
+                    "FLOAT",
+                    {"default": 0.000001, "min": 0.0, "max": 0.0001, "step": 0.0000001},
+                ),
+            },
+            "hidden": {"prompt": "PROMPT", "unique_id": "UNIQUE_ID"},
+        }
+
+    RETURN_TYPES = ("MODEL",)
+    FUNCTION = "apply"
+    CATEGORY = "MiniMax H3/Keyless/diagnostics"
+    DESCRIPTION = (
+        "Single-run native-BF16 capture for Sol K1/K2 real-H3 arithmetic replay. "
+        "This is deliberately separate from the canonical Stage-A training dataset: "
+        "no case_id, train/holdout split, dataset manifest, or multi-case campaign is required."
+    )
+
+    def apply(
+        self,
+        model,
+        target_sigma: float,
+        output_subdir: str,
+        max_capture_mib: int,
+        sigma_tolerance: float = 1e-6,
+        prompt=None,
+        unique_id=None,
+    ):
+        import folder_paths
+
+        if not isinstance(prompt, dict) or unique_id is None:
+            raise RuntimeError(
+                "real-H3 replay capture requires Comfy's executed API prompt and node identity"
+            )
+        cloned = install_from_comfy_node(
+            model,
+            target_sigma=float(target_sigma),
+            output_subdir=output_subdir,
+            max_capture_mib=int(max_capture_mib),
+            sigma_tolerance=float(sigma_tolerance),
+            prompt=prompt,
+            unique_id=unique_id,
+            plugin_root=Path(__file__).resolve().parent,
+            comfy_root=Path(folder_paths.__file__).resolve().parent,
+            output_root=folder_paths.get_output_directory(),
+        )
+        return (cloned,)
+
+
 class MiniMaxH3ProgressiveOverlay:
     @classmethod
     def INPUT_TYPES(cls):
@@ -431,6 +502,7 @@ NODE_CLASS_MAPPINGS = {
     "MiniMaxH3StageATeacherLoader": MiniMaxH3StageATeacherLoader,
     "MiniMaxH3ProgressiveSnapshotLoader": MiniMaxH3ProgressiveSnapshotLoader,
     "MiniMaxH3StageACapture": MiniMaxH3StageACapture,
+    "MiniMaxH3RealH3ReplayCapture": MiniMaxH3RealH3ReplayCapture,
     "MiniMaxH3ProgressiveOverlay": MiniMaxH3ProgressiveOverlay,
     "MiniMaxH3ProgressiveCapture": MiniMaxH3ProgressiveCapture,
 }
@@ -439,6 +511,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "MiniMaxH3StageATeacherLoader": "MiniMax H3 Stage-A BF16 Teacher Loader",
     "MiniMaxH3ProgressiveSnapshotLoader": "MiniMax H3 Progressive Snapshot Loader",
     "MiniMaxH3StageACapture": "MiniMax H3 Stage-A Capture",
+    "MiniMaxH3RealH3ReplayCapture": "MiniMax H3 Real-H3 Replay Capture",
     "MiniMaxH3ProgressiveOverlay": "MiniMax H3 Progressive Prefix Overlay",
     "MiniMaxH3ProgressiveCapture": "MiniMax H3 Progressive Capture",
 }
