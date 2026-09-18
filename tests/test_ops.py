@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from minimax_h3_keyless.contracts import RowDomain, RoutingPreprocessor, RoutingSpecV1
@@ -105,6 +106,69 @@ def test_domain_aware_preprocessor_receives_composed_domains_after_selection() -
         route,
         rms_norm(selected_v, torch.ones(4), 1e-5) * 3.0,
     )
+
+
+def test_legacy_preprocessor_fails_closed_after_row_selection() -> None:
+    torch.manual_seed(23)
+    v = torch.randn(5, 2, 4)
+    spec = RoutingSpecV1(
+        api=1,
+        block_index=5,
+        norm_weight=torch.ones(4),
+        norm_epsilon=1e-5,
+        preprocessors=(
+            RoutingPreprocessor("legacy-full-domain", lambda route: route),
+        ),
+    )
+    selected_v, selected_spec, _ = spec.select_value_rows(
+        v,
+        (4, 1, 3),
+        identity="selected",
+    )
+
+    with pytest.raises(RuntimeError, match="domain-aware ABI"):
+        materialize_route(selected_v, selected_spec)
+
+
+def test_legacy_preprocessor_accepts_explicit_full_identity_domains() -> None:
+    torch.manual_seed(24)
+    v = torch.randn(5, 2, 4)
+    spec = RoutingSpecV1(
+        api=1,
+        block_index=6,
+        norm_weight=torch.ones(4),
+        norm_epsilon=1e-5,
+        value_domain=RowDomain(start=0, stop=5, identity="values"),
+        routing_position_domain=RowDomain(start=0, stop=5, identity="positions"),
+        preprocessors=(
+            RoutingPreprocessor("legacy-full-domain", lambda route: route * 2.0),
+        ),
+    )
+
+    route = materialize_route(v, spec)
+
+    torch.testing.assert_close(
+        route,
+        rms_norm(v, torch.ones(4), 1e-5) * 2.0,
+    )
+
+
+def test_legacy_preprocessor_fails_closed_without_selected_routing_positions() -> None:
+    torch.manual_seed(25)
+    v = torch.randn(3, 2, 4)
+    spec = RoutingSpecV1(
+        api=1,
+        block_index=7,
+        norm_weight=torch.ones(4),
+        norm_epsilon=1e-5,
+        value_domain=RowDomain(indices=(4, 1, 3), identity="selected"),
+        preprocessors=(
+            RoutingPreprocessor("legacy-full-domain", lambda route: route),
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="domain-aware ABI"):
+        materialize_route(v, spec)
 
 
 def test_dense_oracle_matches_torch_sdpa_with_measure_and_mask() -> None:

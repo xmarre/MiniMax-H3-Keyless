@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from .contracts import ROPE_ROT_DIM, RoutingSpecV1
+from .contracts import ROPE_ROT_DIM, RowDomain, RoutingSpecV1
 
 
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -67,10 +67,40 @@ def normalized_positioned(
     return y
 
 
+def _row_domain_is_local_identity(domain: RowDomain | None, rows: int) -> bool:
+    if domain is None:
+        return True
+    if domain.indices is not None:
+        return len(domain.indices) == rows and all(
+            index == local_index
+            for local_index, index in enumerate(domain.indices)
+        )
+    if domain.start is not None and domain.stop is not None:
+        return domain.start == 0 and domain.stop == rows
+    return False
+
+
+def _requires_domain_aware_preprocessor(spec: RoutingSpecV1, rows: int) -> bool:
+    routing_domain = spec.routing_position_domain
+    if routing_domain is not None:
+        return not _row_domain_is_local_identity(routing_domain, rows)
+    value_domain = spec.value_domain
+    return value_domain is not None and not _row_domain_is_local_identity(
+        value_domain,
+        rows,
+    )
+
+
 def materialize_route(v: torch.Tensor, spec: RoutingSpecV1) -> torch.Tensor:
     route = normalized_positioned(v, spec.norm_weight, spec.norm_epsilon, spec.rope_freqs)
+    domain_aware_required = _requires_domain_aware_preprocessor(spec, int(v.shape[0]))
     for preprocessor in spec.preprocessors:
         if preprocessor.domain_fn is None:
+            if domain_aware_required:
+                raise RuntimeError(
+                    f"routing preprocessor {preprocessor.identity!r} lacks the "
+                    "domain-aware ABI required for a selected/reordered routing domain"
+                )
             updated = preprocessor.fn(route)
         else:
             updated = preprocessor.domain_fn(
