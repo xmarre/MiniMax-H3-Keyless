@@ -70,7 +70,14 @@ def normalized_positioned(
 def materialize_route(v: torch.Tensor, spec: RoutingSpecV1) -> torch.Tensor:
     route = normalized_positioned(v, spec.norm_weight, spec.norm_epsilon, spec.rope_freqs)
     for preprocessor in spec.preprocessors:
-        updated = preprocessor.fn(route)
+        if preprocessor.domain_fn is None:
+            updated = preprocessor.fn(route)
+        else:
+            updated = preprocessor.domain_fn(
+                route,
+                spec.value_domain,
+                spec.routing_position_domain,
+            )
         if updated.shape != route.shape:
             raise RuntimeError(
                 f"routing preprocessor {preprocessor.identity!r} changed route shape "
