@@ -75,7 +75,12 @@ def _routing_preprocessors(transformer_options: Mapping[str, Any]) -> tuple[Rout
         identity = getattr(item, "identity", None)
         if identity is None or not callable(item):
             raise RuntimeError("invalid Keyless routing preprocessor; expected callable with identity")
-        out.append(RoutingPreprocessor(str(identity), item))
+        domain_fn = getattr(item, "apply_domain", None)
+        if domain_fn is not None and not callable(domain_fn):
+            raise RuntimeError(
+                "invalid Keyless routing preprocessor apply_domain; expected callable"
+            )
+        out.append(RoutingPreprocessor(str(identity), item, domain_fn))
     return tuple(out)
 
 
